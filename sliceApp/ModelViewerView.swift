@@ -2108,8 +2108,8 @@ struct ModelViewerScreen: View {
         scene.rootNode.enumerateChildNodes { node, _ in
             guard let geometry = node.geometry else { return }
 
-            let hasNormals = !geometry.sources(for: .normal).isEmpty
-            if !hasNormals {
+            let needsNormals = geometry.sources(for: .normal).isEmpty || !Self.hasValidNormals(geometry)
+            if needsNormals {
                 if let newGeo = Self.generateNormals(for: geometry) {
                     node.geometry = newGeo
                     newGeo.materials = geometry.materials
@@ -2142,6 +2142,47 @@ struct ModelViewerScreen: View {
                 }
             }
         }
+    }
+
+    /// Check if normals are valid (not all zero or all identical)
+    private static func hasValidNormals(_ geometry: SCNGeometry) -> Bool {
+        guard let normalSource = geometry.sources(for: .normal).first else { return false }
+        let count = normalSource.vectorCount
+        guard count > 0 else { return false }
+        let stride = normalSource.dataStride
+        let offset = normalSource.dataOffset
+        let data = normalSource.data
+        let bpc = normalSource.bytesPerComponent
+
+        var firstNx: Float = 0, firstNy: Float = 0, firstNz: Float = 0
+        var allSame = true
+        let samplesToCheck = min(count, 50)  // check up to 50 normals
+
+        for i in 0..<samplesToCheck {
+            let base = offset + i * stride
+            var nx: Float = 0, ny: Float = 0, nz: Float = 0
+            if bpc == 8 {
+                var dx: Double = 0, dy: Double = 0, dz: Double = 0
+                _ = withUnsafeMutableBytes(of: &dx) { data.copyBytes(to: $0, from: base..<(base + 8)) }
+                _ = withUnsafeMutableBytes(of: &dy) { data.copyBytes(to: $0, from: (base + 8)..<(base + 16)) }
+                _ = withUnsafeMutableBytes(of: &dz) { data.copyBytes(to: $0, from: (base + 16)..<(base + 24)) }
+                nx = Float(dx); ny = Float(dy); nz = Float(dz)
+            } else {
+                _ = withUnsafeMutableBytes(of: &nx) { data.copyBytes(to: $0, from: base..<(base + 4)) }
+                _ = withUnsafeMutableBytes(of: &ny) { data.copyBytes(to: $0, from: (base + 4)..<(base + 8)) }
+                _ = withUnsafeMutableBytes(of: &nz) { data.copyBytes(to: $0, from: (base + 8)..<(base + 12)) }
+            }
+            let len = nx * nx + ny * ny + nz * nz
+            if len < 0.01 { return false }  // zero-length normal found
+            if i == 0 {
+                firstNx = nx; firstNy = ny; firstNz = nz
+            } else {
+                if abs(nx - firstNx) > 0.001 || abs(ny - firstNy) > 0.001 || abs(nz - firstNz) > 0.001 {
+                    allSame = false
+                }
+            }
+        }
+        return !allSame  // if all sampled normals are identical, they're not useful
     }
 
     private static func generateNormals(for geometry: SCNGeometry) -> SCNGeometry? {
