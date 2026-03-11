@@ -1125,7 +1125,7 @@ class ClipGeometryCache {
             var triangles: [TriangleData] = []
 
             for element in geometry.elements {
-                guard element.primitiveType == .triangles else { continue }
+                guard element.primitiveType == .triangles || element.primitiveType == .triangleStrip else { continue }
                 let idxData = element.data
                 let bpi = element.bytesPerIndex
 
@@ -1148,8 +1148,16 @@ class ClipGeometryCache {
                     }
                 }
 
-                for t in 0..<element.primitiveCount {
-                    let i0 = readIdx(t * 3), i1 = readIdx(t * 3 + 1), i2 = readIdx(t * 3 + 2)
+                // Read total index count based on primitive type
+                let totalIndices: Int
+                if element.primitiveType == .triangles {
+                    totalIndices = element.primitiveCount * 3
+                } else {
+                    // Triangle strip: primitiveCount triangles = primitiveCount + 2 indices
+                    totalIndices = element.primitiveCount + 2
+                }
+
+                func addTriangle(_ i0: Int, _ i1: Int, _ i2: Int) {
                     let v0 = readVec(vertexSource, i0)
                     let v1 = readVec(vertexSource, i1)
                     let v2 = readVec(vertexSource, i2)
@@ -1162,7 +1170,6 @@ class ClipGeometryCache {
                         n0 = fn; n1 = fn; n2 = fn
                     }
 
-                    // Y in world space = localY + node's world Y offset
                     let wy0 = v0.y + nodeOffsetY, wy1 = v1.y + nodeOffsetY, wy2 = v2.y + nodeOffsetY
                     triangles.append(TriangleData(
                         vertices: [v0, v1, v2],
@@ -1170,6 +1177,28 @@ class ClipGeometryCache {
                         minY: min(wy0, wy1, wy2),
                         maxY: max(wy0, wy1, wy2)
                     ))
+                }
+
+                if element.primitiveType == .triangles {
+                    for t in 0..<element.primitiveCount {
+                        let i0 = readIdx(t * 3), i1 = readIdx(t * 3 + 1), i2 = readIdx(t * 3 + 2)
+                        addTriangle(i0, i1, i2)
+                    }
+                } else {
+                    // Triangle strip
+                    guard totalIndices >= 3 else { continue }
+                    for i in 0..<(totalIndices - 2) {
+                        let idx0 = readIdx(i)
+                        let idx1: Int, idx2: Int
+                        if i % 2 == 0 {
+                            idx1 = readIdx(i + 1)
+                            idx2 = readIdx(i + 2)
+                        } else {
+                            idx1 = readIdx(i + 2)
+                            idx2 = readIdx(i + 1)
+                        }
+                        addTriangle(idx0, idx1, idx2)
+                    }
                 }
             }
 
