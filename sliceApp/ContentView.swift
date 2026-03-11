@@ -1,21 +1,19 @@
-//
-//  ContentView.swift
-//  sliceApp
-//
-//  Created by Isai Pérez Rojas on 10/03/26.
-//
-
 import SwiftUI
 
 struct ContentView: View {
     var body: some View {
-        VStack {
-            Image(systemName: "globe")
-                .imageScale(.large)
-                .foregroundStyle(.tint)
-            Text("Hello, world!")
+        FileExplorerView()
+            .onAppear {
+                loadSavedFiles()
+            }
+    }
+
+    private func loadSavedFiles() {
+        // Ensure documents directory exists
+        let documentsDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        if !FileManager.default.fileExists(atPath: documentsDir.path) {
+            try? FileManager.default.createDirectory(at: documentsDir, withIntermediateDirectories: true)
         }
-        .padding()
     }
 }
 
