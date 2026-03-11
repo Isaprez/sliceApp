@@ -814,6 +814,8 @@ struct BaseControlPanel: View {
     let onStartFaceSelect: () -> Void
     let onConfirmBase: () -> Void
     let onCancelSelect: () -> Void
+    let onSave: () -> Void
+    let isSaving: Bool
     let onClose: () -> Void
 
     var body: some View {
@@ -836,6 +838,30 @@ struct BaseControlPanel: View {
             axisRotation(label: "X", color: .red, degrees: $degreesX, axis: SCNVector3(1, 0, 0))
             axisRotation(label: "Y", color: .green, degrees: $degreesY, axis: SCNVector3(0, 1, 0))
             axisRotation(label: "Z", color: .blue, degrees: $degreesZ, axis: SCNVector3(0, 0, 1))
+
+            Button {
+                onSave()
+            } label: {
+                HStack(spacing: 6) {
+                    if isSaving {
+                        ProgressView()
+                            .tint(.white)
+                            .scaleEffect(0.7)
+                    } else {
+                        Image(systemName: "square.and.arrow.down")
+                    }
+                    Text(isSaving ? "Guardando..." : "Guardar orientación")
+                }
+                .font(.subheadline)
+                .fontWeight(.medium)
+                .foregroundStyle(.white)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 10)
+                .background(Color.blue)
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+            }
+            .disabled(isSaving || isSelectingFace)
+            .padding(.top, 4)
 
             Divider().overlay(Color.white.opacity(0.15)).padding(.vertical, 4)
 
@@ -909,9 +935,9 @@ struct BaseControlPanel: View {
                 .frame(width: 16)
 
             Button {
-                let newVal = degrees.wrappedValue - 5
+                let newVal = degrees.wrappedValue - 10
                 degrees.wrappedValue = newVal
-                onRotateAxis(axis, -5)
+                onRotateAxis(axis, -10)
             } label: {
                 Image(systemName: "minus.circle.fill")
                     .foregroundStyle(color)
@@ -941,9 +967,9 @@ struct BaseControlPanel: View {
                 .foregroundStyle(.white.opacity(0.6))
 
             Button {
-                let newVal = degrees.wrappedValue + 5
+                let newVal = degrees.wrappedValue + 10
                 degrees.wrappedValue = newVal
-                onRotateAxis(axis, 5)
+                onRotateAxis(axis, 10)
             } label: {
                 Image(systemName: "plus.circle.fill")
                     .foregroundStyle(color)
@@ -972,6 +998,7 @@ struct ModelViewerScreen: View {
     @State private var rotDegreesX: Float = 0
     @State private var rotDegreesY: Float = 0
     @State private var rotDegreesZ: Float = 0
+    @State private var isSavingOrientation = false
     @State private var showSideMenu = false
     @State private var dimensions: ModelDimensions?
     @State private var scaleX: Float = 1.0
@@ -1040,6 +1067,10 @@ struct ModelViewerScreen: View {
                                 isSelectingFace = false
                                 selectedFaceNormal = nil
                             },
+                            onSave: {
+                                saveOrientationToFile()
+                            },
+                            isSaving: isSavingOrientation,
                             onClose: {
                                 withAnimation(.easeInOut(duration: 0.25)) {
                                     showBasePanel = false
@@ -1277,6 +1308,19 @@ struct ModelViewerScreen: View {
         isSaving = false
     }
 
+    /// Saves orientation changes to file with UI feedback
+    private func saveOrientationToFile() {
+        isSavingOrientation = true
+        saveCurrentGeometry()
+        if saveResult == nil {
+            saveResult = ConversionResult(
+                isSuccess: true,
+                message: "Orientación guardada en el archivo"
+            )
+        }
+        isSavingOrientation = false
+    }
+
     /// Saves the current model geometry to the original file
     private func saveCurrentGeometry() {
         guard let scene else { return }
@@ -1346,9 +1390,6 @@ struct ModelViewerScreen: View {
 
         // Update dimensions
         dimensions = ModelDimensions.compute(from: scene)
-
-        // Save rotation to file
-        saveCurrentGeometry()
     }
 
     /// Rotates the model so the selected face normal points down (-Y), making it the base
@@ -1408,9 +1449,6 @@ struct ModelViewerScreen: View {
         dimensions = ModelDimensions.compute(from: scene)
         isSelectingFace = false
         selectedFaceNormal = nil
-
-        // Save rotation to file
-        saveCurrentGeometry()
     }
 
     /// Rotates geometry vertices and normals by angle around axis
