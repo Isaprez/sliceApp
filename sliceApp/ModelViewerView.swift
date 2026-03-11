@@ -1202,24 +1202,30 @@ class ClipGeometryCache {
                         addTriangle(idx0, idx1, idx2)
                     }
                 } else if primType == .polygon {
-                    // Polygon data: [vertCount, idx0, idx1, ..., vertCount, idx0, ...]
-                    // Fan-triangulate each polygon
-                    var bytePos = 0
-                    for _ in 0..<element.primitiveCount {
-                        let vertCount = readIdx(bytePos)
-                        bytePos += bpi
-                        guard vertCount >= 3 else {
-                            bytePos += vertCount * bpi
+                    // SceneKit polygon format: first primitiveCount values are vertex counts,
+                    // followed by all vertex indices concatenated
+                    let polyCount = element.primitiveCount
+                    var vertCounts: [Int] = []
+                    vertCounts.reserveCapacity(polyCount)
+                    for p in 0..<polyCount {
+                        vertCounts.append(readIdx(p * bpi))
+                    }
+                    var idxOffset = polyCount * bpi  // indices start after all vertex counts
+                    for p in 0..<polyCount {
+                        let vc = vertCounts[p]
+                        guard vc >= 3 else {
+                            idxOffset += vc * bpi
                             continue
                         }
-                        let firstIdx = readIdx(bytePos)
-                        var prevIdx = readIdx(bytePos + bpi)
-                        for v in 2..<vertCount {
-                            let curIdx = readIdx(bytePos + v * bpi)
+                        // Fan-triangulate: (v0, v1, v2), (v0, v2, v3), ...
+                        let firstIdx = readIdx(idxOffset)
+                        var prevIdx = readIdx(idxOffset + bpi)
+                        for v in 2..<vc {
+                            let curIdx = readIdx(idxOffset + v * bpi)
                             addTriangle(firstIdx, prevIdx, curIdx)
                             prevIdx = curIdx
                         }
-                        bytePos += vertCount * bpi
+                        idxOffset += vc * bpi
                     }
                 }
             }
@@ -2145,43 +2151,82 @@ struct ModelViewerScreen: View {
         let vectorCount = vertexSource.vectorCount
         let stride = vertexSource.dataStride
         let offset = vertexSource.dataOffset
+        let bpc = vertexSource.bytesPerComponent
 
         var positions: [(Float, Float, Float)] = []
         for i in 0..<vectorCount {
             let base = offset + i * stride
             var x: Float = 0, y: Float = 0, z: Float = 0
-            _ = withUnsafeMutableBytes(of: &x) { vertices.copyBytes(to: $0, from: base..<(base + 4)) }
-            _ = withUnsafeMutableBytes(of: &y) { vertices.copyBytes(to: $0, from: (base + 4)..<(base + 8)) }
-            _ = withUnsafeMutableBytes(of: &z) { vertices.copyBytes(to: $0, from: (base + 8)..<(base + 12)) }
+            if bpc == 8 {
+                var dx: Double = 0, dy: Double = 0, dz: Double = 0
+                _ = withUnsafeMutableBytes(of: &dx) { vertices.copyBytes(to: $0, from: base..<(base + 8)) }
+                _ = withUnsafeMutableBytes(of: &dy) { vertices.copyBytes(to: $0, from: (base + 8)..<(base + 16)) }
+                _ = withUnsafeMutableBytes(of: &dz) { vertices.copyBytes(to: $0, from: (base + 16)..<(base + 24)) }
+                x = Float(dx); y = Float(dy); z = Float(dz)
+            } else {
+                _ = withUnsafeMutableBytes(of: &x) { vertices.copyBytes(to: $0, from: base..<(base + 4)) }
+                _ = withUnsafeMutableBytes(of: &y) { vertices.copyBytes(to: $0, from: (base + 4)..<(base + 8)) }
+                _ = withUnsafeMutableBytes(of: &z) { vertices.copyBytes(to: $0, from: (base + 8)..<(base + 12)) }
+            }
             positions.append((x, y, z))
         }
 
         var vertexNormals = [(Float, Float, Float)](repeating: (0, 0, 0), count: vectorCount)
 
+        func accumulateNormal(_ i0: Int, _ i1: Int, _ i2: Int) {
+            guard i0 < positions.count, i1 < positions.count, i2 < positions.count else { return }
+            let v0 = positions[i0], v1 = positions[i1], v2 = positions[i2]
+            let ux = v1.0 - v0.0, uy = v1.1 - v0.1, uz = v1.2 - v0.2
+            let vx = v2.0 - v0.0, vy = v2.1 - v0.1, vz = v2.2 - v0.2
+            let nx = uy * vz - uz * vy
+            let ny = uz * vx - ux * vz
+            let nz = ux * vy - uy * vx
+            for idx in [i0, i1, i2] {
+                vertexNormals[idx].0 += nx
+                vertexNormals[idx].1 += ny
+                vertexNormals[idx].2 += nz
+            }
+        }
+
         for element in geometry.elements {
             let indices = extractIndices(from: element)
-            let triCount: Int
+
             switch element.primitiveType {
-            case .triangles: triCount = indices.count / 3
-            default: continue
-            }
-
-            for t in 0..<triCount {
-                let i0 = indices[t * 3], i1 = indices[t * 3 + 1], i2 = indices[t * 3 + 2]
-                guard i0 < positions.count, i1 < positions.count, i2 < positions.count else { continue }
-
-                let v0 = positions[i0], v1 = positions[i1], v2 = positions[i2]
-                let ux = v1.0 - v0.0, uy = v1.1 - v0.1, uz = v1.2 - v0.2
-                let vx = v2.0 - v0.0, vy = v2.1 - v0.1, vz = v2.2 - v0.2
-                let nx = uy * vz - uz * vy
-                let ny = uz * vx - ux * vz
-                let nz = ux * vy - uy * vx
-
-                for idx in [i0, i1, i2] {
-                    vertexNormals[idx].0 += nx
-                    vertexNormals[idx].1 += ny
-                    vertexNormals[idx].2 += nz
+            case .triangles:
+                for t in 0..<(indices.count / 3) {
+                    accumulateNormal(indices[t * 3], indices[t * 3 + 1], indices[t * 3 + 2])
                 }
+            case .triangleStrip:
+                guard indices.count >= 3 else { continue }
+                for i in 0..<(indices.count - 2) {
+                    if i % 2 == 0 {
+                        accumulateNormal(indices[i], indices[i + 1], indices[i + 2])
+                    } else {
+                        accumulateNormal(indices[i], indices[i + 2], indices[i + 1])
+                    }
+                }
+            case .polygon:
+                // Polygon: first primitiveCount values are vertex counts, rest are indices
+                let polyCount = element.primitiveCount
+                guard indices.count > polyCount else { continue }
+                var idxPos = polyCount
+                for p in 0..<polyCount {
+                    let vc = indices[p]
+                    guard vc >= 3, idxPos + vc <= indices.count else {
+                        idxPos += max(vc, 0)
+                        continue
+                    }
+                    let first = indices[idxPos]
+                    var prev = indices[idxPos + 1]
+                    for v in 2..<vc {
+                        let cur = indices[idxPos + v]
+                        accumulateNormal(first, prev, cur)
+                        prev = cur
+                    }
+                    idxPos += vc
+                }
+            default:
+                continue
             }
         }
 
@@ -2218,10 +2263,12 @@ struct ModelViewerScreen: View {
     private static func extractIndices(from element: SCNGeometryElement) -> [Int] {
         let data = element.data
         let bytesPerIndex = element.bytesPerIndex
+        // For polygon type, read ALL values (vertex counts + indices)
         let totalIndices: Int
         switch element.primitiveType {
         case .triangles: totalIndices = element.primitiveCount * 3
         case .triangleStrip: totalIndices = element.primitiveCount + 2
+        case .polygon: totalIndices = data.count / bytesPerIndex  // read everything
         default: totalIndices = element.primitiveCount * 3
         }
 
