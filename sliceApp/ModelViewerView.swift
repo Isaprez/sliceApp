@@ -88,40 +88,58 @@ nonisolated struct SceneGridBuilder {
         let gridExtent = ceilToNice(maxSize * 1.5)
         let gridStep = ceilToNice(gridExtent / 10)
 
-        // XZ plane grid (floor)
+        // XZ plane grid (floor) at Y=0 (model base)
         let floorGrid = buildPlaneGrid(
             extent: gridExtent, step: gridStep,
             axis1: SCNVector3(1, 0, 0), axis2: SCNVector3(0, 0, 1),
             color: UIColor(white: 0.35, alpha: 0.5)
         )
-        floorGrid.position = SCNVector3(0, sceneMin.y, 0)
+        floorGrid.position = SCNVector3(0, 0, 0)
         root.addChildNode(floorGrid)
 
-        // Axes
-        let axisLength = gridExtent * 0.6
+        // Axes at origin (base of the model, centered XZ)
+        // Length proportional to model size
+        let axisLength = maxSize > 0 ? maxSize * 0.8 : gridExtent * 0.6
         root.addChildNode(buildAxis(direction: SCNVector3(axisLength, 0, 0), color: .systemRed, label: "X"))
         root.addChildNode(buildAxis(direction: SCNVector3(0, axisLength, 0), color: .systemGreen, label: "Y"))
         root.addChildNode(buildAxis(direction: SCNVector3(0, 0, axisLength), color: .systemBlue, label: "Z"))
 
-        // Origin sphere
+        // Negative axes (dashed/dimmer)
+        root.addChildNode(buildAxis(direction: SCNVector3(-axisLength, 0, 0), color: .systemRed.withAlphaComponent(0.3), label: ""))
+        root.addChildNode(buildAxis(direction: SCNVector3(0, 0, -axisLength), color: .systemBlue.withAlphaComponent(0.3), label: ""))
+
+        // Origin sphere at Y=0
         let originGeo = SCNSphere(radius: Double(gridStep * 0.08))
         let originMat = SCNMaterial()
         originMat.diffuse.contents = UIColor.white
         originMat.lightingModel = .constant
         originGeo.materials = [originMat]
         let originNode = SCNNode(geometry: originGeo)
+        originNode.position = SCNVector3(0, 0, 0)
         root.addChildNode(originNode)
 
         return root
     }
 
     private static func sceneBounds(_ scene: SCNScene) -> (SCNVector3, SCNVector3) {
+        // Use the __model__ container bounds directly if available
+        if let modelNode = scene.rootNode.childNode(withName: "__model__", recursively: false) {
+            let (localMin, localMax) = modelNode.boundingBox
+            let worldMin = modelNode.convertPosition(localMin, to: nil)
+            let worldMax = modelNode.convertPosition(localMax, to: nil)
+            return (
+                SCNVector3(min(worldMin.x, worldMax.x), min(worldMin.y, worldMax.y), min(worldMin.z, worldMax.z)),
+                SCNVector3(max(worldMin.x, worldMax.x), max(worldMin.y, worldMax.y), max(worldMin.z, worldMax.z))
+            )
+        }
+
         var minB = SCNVector3(Float.greatestFiniteMagnitude, Float.greatestFiniteMagnitude, Float.greatestFiniteMagnitude)
         var maxB = SCNVector3(-Float.greatestFiniteMagnitude, -Float.greatestFiniteMagnitude, -Float.greatestFiniteMagnitude)
         var found = false
 
         scene.rootNode.enumerateChildNodes { node, _ in
-            guard node.geometry != nil, node.name != "__grid_root__" else { return }
+            guard node.geometry != nil,
+                  !(node.name ?? "").hasPrefix("__") else { return }
             let (localMin, localMax) = node.boundingBox
             let worldMin = node.convertPosition(localMin, to: nil)
             let worldMax = node.convertPosition(localMax, to: nil)
@@ -299,6 +317,15 @@ struct ModelDimensions {
     }
 
     static func compute(from scene: SCNScene) -> ModelDimensions {
+        if let modelNode = scene.rootNode.childNode(withName: "__model__", recursively: false) {
+            let (localMin, localMax) = modelNode.boundingBox
+            return ModelDimensions(
+                width: abs(localMax.x - localMin.x) * modelNode.scale.x,
+                height: abs(localMax.y - localMin.y) * modelNode.scale.y,
+                depth: abs(localMax.z - localMin.z) * modelNode.scale.z
+            )
+        }
+
         var minB = SCNVector3(Float.greatestFiniteMagnitude, Float.greatestFiniteMagnitude, Float.greatestFiniteMagnitude)
         var maxB = SCNVector3(-Float.greatestFiniteMagnitude, -Float.greatestFiniteMagnitude, -Float.greatestFiniteMagnitude)
         var found = false
@@ -875,12 +902,11 @@ struct ModelViewerScreen: View {
 
         let modelNode = SCNNode(geometry: geometry)
         let (minBound, maxBound) = modelNode.boundingBox
-        let center = SCNVector3(
-            (minBound.x + maxBound.x) / 2,
-            (minBound.y + maxBound.y) / 2,
-            (minBound.z + maxBound.z) / 2
-        )
-        modelNode.position = SCNVector3(-center.x, -center.y, -center.z)
+
+        // Center XZ, put base on Y=0
+        let centerX = (minBound.x + maxBound.x) / 2
+        let centerZ = (minBound.z + maxBound.z) / 2
+        modelNode.position = SCNVector3(-centerX, -minBound.y, -centerZ)
 
         let containerNode = SCNNode()
         containerNode.name = "__model__"
@@ -889,20 +915,20 @@ struct ModelViewerScreen: View {
 
         let cameraNode = SCNNode()
         cameraNode.camera = SCNCamera()
-        let maxDimension = max(
-            maxBound.x - minBound.x,
-            maxBound.y - minBound.y,
-            maxBound.z - minBound.z
-        )
-        let distance = maxDimension > 0 ? maxDimension * 2 : 10
-        cameraNode.position = SCNVector3(0, 0, distance)
+        let sizeX = maxBound.x - minBound.x
+        let sizeY = maxBound.y - minBound.y
+        let sizeZ = maxBound.z - minBound.z
+        let maxDimension = max(sizeX, max(sizeY, sizeZ))
+        let distance = maxDimension > 0 ? maxDimension * 2.5 : 10
+        // Camera looking at center of model height
+        cameraNode.position = SCNVector3(0, sizeY / 2, distance)
         cameraNode.camera?.automaticallyAdjustsZRange = true
         scene.rootNode.addChildNode(cameraNode)
 
         return scene
     }
 
-    /// Wraps all scene content in a named container node for scaling
+    /// Wraps all scene content in a named container node and repositions so base sits on Y=0
     private func wrapModelNodes(in scene: SCNScene) {
         let container = SCNNode()
         container.name = "__model__"
@@ -911,7 +937,29 @@ struct ModelViewerScreen: View {
             child.removeFromParentNode()
             container.addChildNode(child)
         }
+
+        // Calculate bounds of all geometry in the container
+        let (minB, maxB) = container.boundingBox
+        let centerX = (minB.x + maxB.x) / 2
+        let centerZ = (minB.z + maxB.z) / 2
+
+        // Offset so base is on Y=0 and centered on XZ
+        container.position = SCNVector3(-centerX, -minB.y, -centerZ)
+
         scene.rootNode.addChildNode(container)
+
+        // Add camera
+        let sizeX = maxB.x - minB.x
+        let sizeY = maxB.y - minB.y
+        let sizeZ = maxB.z - minB.z
+        let maxDimension = max(sizeX, max(sizeY, sizeZ))
+        let distance = maxDimension > 0 ? maxDimension * 2.5 : 10
+
+        let cameraNode = SCNNode()
+        cameraNode.camera = SCNCamera()
+        cameraNode.position = SCNVector3(0, sizeY / 2, distance)
+        cameraNode.camera?.automaticallyAdjustsZRange = true
+        scene.rootNode.addChildNode(cameraNode)
     }
 
     /// Ensures all geometry nodes have normals and a proper material
