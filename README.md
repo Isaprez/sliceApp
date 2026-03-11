@@ -16,7 +16,8 @@ Aplicación iOS enfocada en la preparación de archivos 3D para impresión en re
 - Iluminación tipo estudio: key light, fill light, rim light y ambient
 - Controles táctiles: rotar, zoom y pan
 - Materiales con sombreado Phong, reflejo specular y doble cara
-- Generación automática de normales para archivos que no las incluyen
+- Generación automática de normales con validación (detecta normales cero o uniformes)
+- Soporte para vértices Float y Double
 - Modelo posicionado en cuadrante positivo (X+, Y+, Z+) con base en Y=0
 
 ### Cuadrícula y ejes
@@ -42,14 +43,21 @@ Aplicación iOS enfocada en la preparación de archivos 3D para impresión en re
 ### Orientar base
 - Panel con controles de rotación independientes por eje (X, Y, Z)
 - Campo de texto para escribir grados exactos
-- Botones -/+ que rotan 5° por clic
+- Botones -/+ que rotan 10° por clic
+- Botón **Guardar orientación** para aplicar los cambios al archivo
 - **Seleccionar cara como base**: modo interactivo donde tocas una cara del modelo y se resalta la superficie plana completa; al confirmar, el modelo rota para que esa cara quede como base en Y=0
-- Los cambios de orientación se guardan automáticamente al archivo
+
+### Sección transversal (Cross-section)
+- Slider vertical doble para recortar el modelo desde arriba y/o desde abajo
+- Permite visualizar partes internas del modelo en tiempo real
+- Compatible con STL, OBJ y todos los formatos soportados
+- Soporta geometría con triángulos, triangle strips y polígonos (quads/ngons)
 
 ### Conversión de formatos
 - Conversión nativa usando ModelIO de Apple
 - OBJ → STL | STL → OBJ | DAE/USDZ → STL u OBJ
 - Los archivos convertidos se guardan en la app y aparecen en el explorador
+- Regeneración automática de normales para archivos convertidos con normales inválidas
 
 ### Menú lateral
 - Un solo botón (☰) en la esquina superior derecha abre un panel deslizante
