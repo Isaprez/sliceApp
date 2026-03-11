@@ -8,6 +8,8 @@ struct ModelViewerView: UIViewRepresentable {
     let showGrid: Bool
     let modelScale: SIMD3<Float>
     let faceSelectMode: Bool
+    let clipYMin: Float?
+    let clipYMax: Float?
     var onFaceSelected: ((SIMD3<Float>) -> Void)?
 
     func makeCoordinator() -> Coordinator {
@@ -56,6 +58,51 @@ struct ModelViewerView: UIViewRepresentable {
         // Remove highlight when exiting select mode
         if !faceSelectMode {
             scene.rootNode.childNode(withName: "__face_highlight__", recursively: true)?.removeFromParentNode()
+        }
+
+        // Apply Y clipping via shader modifiers
+        if let modelNode = scene.rootNode.childNode(withName: "__model__", recursively: false) {
+            let clippingActive = clipYMin != nil || clipYMax != nil
+            let containerOffsetY = modelNode.position.y
+
+            modelNode.enumerateChildNodes { node, _ in
+                guard let geometry = node.geometry else { return }
+                for material in geometry.materials {
+                    if clippingActive {
+                        if material.shaderModifiers?[.geometry] == nil {
+                            material.shaderModifiers = [
+                                .geometry: """
+                                    #pragma varyings
+                                    float clipModelY;
+
+                                    #pragma body
+                                    _geometry.clipModelY = _geometry.position.y;
+                                    """,
+                                .fragment: """
+                                    #pragma arguments
+                                    float clipYMin;
+                                    float clipYMax;
+
+                                    #pragma body
+                                    if (_geometry.clipModelY < clipYMin || _geometry.clipModelY > clipYMax) {
+                                        discard_fragment();
+                                    }
+                                    """
+                            ]
+                        }
+                        let localMin = (clipYMin ?? -1e10) - containerOffsetY
+                        let localMax = (clipYMax ?? 1e10) - containerOffsetY
+                        material.setValue(localMin as NSNumber, forKey: "clipYMin")
+                        material.setValue(localMax as NSNumber, forKey: "clipYMax")
+                    } else {
+                        if material.shaderModifiers?[.geometry] != nil {
+                            material.shaderModifiers = nil
+                            material.setValue(nil, forKey: "clipYMin")
+                            material.setValue(nil, forKey: "clipYMax")
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -702,6 +749,104 @@ struct DimensionsView: View {
     }
 }
 
+// MARK: - Vertical Clip Slider
+
+struct VerticalClipSlider: View {
+    @Binding var topValue: Float    // 0...1, 1 = full top
+    @Binding var bottomValue: Float // 0...1, 0 = full bottom
+    let modelHeight: Float
+
+    private let trackWidth: CGFloat = 4
+    private let thumbSize: CGFloat = 24
+
+    var body: some View {
+        VStack(spacing: 4) {
+            Text(formatMM(topValue * modelHeight))
+                .font(.system(size: 9))
+                .monospacedDigit()
+                .foregroundStyle(.white.opacity(0.7))
+
+            GeometryReader { geo in
+                let height = geo.size.height
+                let topY = CGFloat(1 - topValue) * (height - thumbSize)
+                let bottomY = CGFloat(1 - bottomValue) * (height - thumbSize)
+
+                ZStack(alignment: .top) {
+                    // Track background
+                    RoundedRectangle(cornerRadius: 2)
+                        .fill(Color.white.opacity(0.15))
+                        .frame(width: trackWidth)
+                        .frame(maxHeight: .infinity)
+                        .position(x: geo.size.width / 2, y: height / 2)
+
+                    // Active range highlight
+                    let activeTop = topY + thumbSize / 2
+                    let activeBottom = bottomY + thumbSize / 2
+                    let activeHeight = max(0, activeBottom - activeTop)
+                    RoundedRectangle(cornerRadius: 2)
+                        .fill(Color.orange.opacity(0.6))
+                        .frame(width: trackWidth + 2, height: activeHeight)
+                        .position(x: geo.size.width / 2, y: activeTop + activeHeight / 2)
+
+                    // Top thumb
+                    clipThumb(color: .orange)
+                        .position(x: geo.size.width / 2, y: topY + thumbSize / 2)
+                        .gesture(
+                            DragGesture()
+                                .onChanged { drag in
+                                    let newY = drag.location.y - thumbSize / 2
+                                    let clamped = max(0, min(newY, height - thumbSize))
+                                    let newVal = 1 - Float(clamped / (height - thumbSize))
+                                    topValue = max(newVal, bottomValue + 0.01)
+                                }
+                        )
+
+                    // Bottom thumb
+                    clipThumb(color: .orange)
+                        .position(x: geo.size.width / 2, y: bottomY + thumbSize / 2)
+                        .gesture(
+                            DragGesture()
+                                .onChanged { drag in
+                                    let newY = drag.location.y - thumbSize / 2
+                                    let clamped = max(0, min(newY, height - thumbSize))
+                                    let newVal = 1 - Float(clamped / (height - thumbSize))
+                                    bottomValue = min(newVal, topValue - 0.01)
+                                }
+                        )
+                }
+            }
+            .frame(width: thumbSize + 8)
+
+            Text(formatMM(bottomValue * modelHeight))
+                .font(.system(size: 9))
+                .monospacedDigit()
+                .foregroundStyle(.white.opacity(0.7))
+        }
+        .padding(.vertical, 8)
+        .padding(.horizontal, 4)
+        .background(.ultraThinMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+    }
+
+    private func clipThumb(color: Color) -> some View {
+        ZStack {
+            Circle()
+                .fill(color)
+                .frame(width: thumbSize, height: thumbSize)
+            Image(systemName: "line.3.horizontal")
+                .font(.system(size: 10, weight: .bold))
+                .foregroundStyle(.white)
+        }
+        .shadow(color: .black.opacity(0.3), radius: 2)
+    }
+
+    private func formatMM(_ value: Float) -> String {
+        if value >= 100 { return String(format: "%.0f", value) }
+        if value >= 10 { return String(format: "%.1f", value) }
+        return String(format: "%.1f", value)
+    }
+}
+
 // MARK: - Scale Panel
 
 struct ScaleControlPanel: View {
@@ -999,6 +1144,9 @@ struct ModelViewerScreen: View {
     @State private var rotDegreesY: Float = 0
     @State private var rotDegreesZ: Float = 0
     @State private var isSavingOrientation = false
+    @State private var showClipSlider = false
+    @State private var clipTop: Float = 1.0
+    @State private var clipBottom: Float = 0.0
     @State private var showSideMenu = false
     @State private var dimensions: ModelDimensions?
     @State private var scaleX: Float = 1.0
@@ -1021,6 +1169,8 @@ struct ModelViewerScreen: View {
                     showGrid: showGrid,
                     modelScale: SIMD3(scaleX, scaleY, scaleZ),
                     faceSelectMode: isSelectingFace,
+                    clipYMin: showClipSlider ? clipBottom * (dimensions?.height ?? 0) : nil,
+                    clipYMax: showClipSlider ? clipTop * (dimensions?.height ?? 0) : nil,
                     onFaceSelected: { normal in
                         selectedFaceNormal = normal
                     }
@@ -1040,6 +1190,22 @@ struct ModelViewerScreen: View {
                 ProgressView("Cargando modelo...")
                     .foregroundStyle(.white)
                     .tint(.white)
+            }
+
+            // Clip slider on the right
+            if scene != nil, showClipSlider, let dimensions {
+                HStack {
+                    Spacer()
+                    VerticalClipSlider(
+                        topValue: $clipTop,
+                        bottomValue: $clipBottom,
+                        modelHeight: dimensions.height
+                    )
+                    .frame(height: 300)
+                    .padding(.trailing, 8)
+                }
+                .padding(.top, 60)
+                .frame(maxHeight: .infinity, alignment: .top)
             }
 
             // Bottom panels
@@ -1134,6 +1300,7 @@ struct ModelViewerScreen: View {
                         showDimensions: $showDimensions,
                         showScalePanel: $showScalePanel,
                         showBasePanel: $showBasePanel,
+                        showClipSlider: $showClipSlider,
                         availableFormats: availableFormats,
                         isConverting: isConverting,
                         onConvert: { format in
@@ -1881,6 +2048,7 @@ struct SideMenuView: View {
     @Binding var showDimensions: Bool
     @Binding var showScalePanel: Bool
     @Binding var showBasePanel: Bool
+    @Binding var showClipSlider: Bool
     let availableFormats: [ModelConverter.OutputFormat]
     let isConverting: Bool
     let onConvert: (ModelConverter.OutputFormat) -> Void
@@ -1921,6 +2089,12 @@ struct SideMenuView: View {
                         icon: showDimensions ? "ruler.fill" : "ruler",
                         title: "Dimensiones",
                         isOn: $showDimensions
+                    )
+
+                    menuToggle(
+                        icon: showClipSlider ? "scissors.circle.fill" : "scissors.circle",
+                        title: "Sección",
+                        isOn: $showClipSlider
                     )
 
                     Divider().overlay(Color.white.opacity(0.1)).padding(.vertical, 8)
