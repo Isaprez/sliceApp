@@ -8,8 +8,6 @@ struct ModelViewerView: UIViewRepresentable {
     let showGrid: Bool
     let modelScale: SIMD3<Float>
     let faceSelectMode: Bool
-    let clipYMin: Float?
-    let clipYMax: Float?
     var onFaceSelected: ((SIMD3<Float>) -> Void)?
 
     func makeCoordinator() -> Coordinator {
@@ -60,52 +58,6 @@ struct ModelViewerView: UIViewRepresentable {
             scene.rootNode.childNode(withName: "__face_highlight__", recursively: true)?.removeFromParentNode()
         }
 
-        // Apply Y clipping via shader modifiers
-        if let modelNode = scene.rootNode.childNode(withName: "__model__", recursively: false) {
-            let clippingActive = clipYMin != nil || clipYMax != nil
-            let containerOffsetY = modelNode.position.y
-
-            modelNode.enumerateChildNodes { node, _ in
-                guard let geometry = node.geometry else { return }
-                for material in geometry.materials {
-                    if clippingActive {
-                        if material.shaderModifiers?[.geometry] == nil {
-                            let geoShader = [
-                                "#pragma varyings",
-                                "float clipModelY;",
-                                "",
-                                "#pragma body",
-                                "_geometry.clipModelY = _geometry.position.y;"
-                            ].joined(separator: "\n")
-
-                            let fragShader = [
-                                "#pragma arguments",
-                                "float clipYMin;",
-                                "float clipYMax;",
-                                "",
-                                "#pragma body",
-                                "if (_geometry.clipModelY < clipYMin || _geometry.clipModelY > clipYMax) {",
-                                "    discard_fragment();",
-                                "}"
-                            ].joined(separator: "\n")
-
-                            material.shaderModifiers = [
-                                .geometry: geoShader,
-                                .fragment: fragShader
-                            ]
-                        }
-                        let localMin = (clipYMin ?? -1e10) - containerOffsetY
-                        let localMax = (clipYMax ?? 1e10) - containerOffsetY
-                        material.setValue(NSNumber(value: localMin), forKey: "clipYMin")
-                        material.setValue(NSNumber(value: localMax), forKey: "clipYMax")
-                    } else {
-                        if material.shaderModifiers?[.geometry] != nil {
-                            material.shaderModifiers = [:]
-                        }
-                    }
-                }
-            }
-        }
     }
 
     class Coordinator: NSObject {
@@ -1127,6 +1079,174 @@ struct BaseControlPanel: View {
     }
 }
 
+// MARK: - Clip Cache
+
+class ClipGeometryCache {
+    struct TriangleData {
+        let vertices: [SIMD3<Float>]  // 3 per triangle
+        let normals: [SIMD3<Float>]   // 3 per triangle
+        let minY: Float
+        let maxY: Float
+    }
+
+    struct NodeCache {
+        let node: SCNNode
+        let originalGeometry: SCNGeometry
+        let triangles: [TriangleData]
+        let containerOffsetY: Float
+    }
+
+    var caches: [NodeCache] = []
+
+    func prepare(scene: SCNScene) {
+        caches.removeAll()
+        guard let modelNode = scene.rootNode.childNode(withName: "__model__", recursively: false) else { return }
+        let offsetY = modelNode.position.y
+
+        modelNode.enumerateChildNodes { node, _ in
+            guard let geometry = node.geometry,
+                  let vertexSource = geometry.sources(for: .vertex).first else { return }
+
+            let normalSource = geometry.sources(for: .normal).first
+
+            func readVec(_ src: SCNGeometrySource, _ idx: Int) -> SIMD3<Float> {
+                guard idx < src.vectorCount else { return .zero }
+                let base = src.dataOffset + idx * src.dataStride
+                var x: Float = 0, y: Float = 0, z: Float = 0
+                _ = withUnsafeMutableBytes(of: &x) { src.data.copyBytes(to: $0, from: base..<(base + 4)) }
+                _ = withUnsafeMutableBytes(of: &y) { src.data.copyBytes(to: $0, from: (base + 4)..<(base + 8)) }
+                _ = withUnsafeMutableBytes(of: &z) { src.data.copyBytes(to: $0, from: (base + 8)..<(base + 12)) }
+                return SIMD3(x, y, z)
+            }
+
+            var triangles: [TriangleData] = []
+
+            for element in geometry.elements {
+                guard element.primitiveType == .triangles else { continue }
+                let idxData = element.data
+                let bpi = element.bytesPerIndex
+
+                func readIdx(_ i: Int) -> Int {
+                    let off = i * bpi
+                    guard off + bpi <= idxData.count else { return 0 }
+                    switch bpi {
+                    case 2:
+                        var v: UInt16 = 0
+                        _ = withUnsafeMutableBytes(of: &v) { idxData.copyBytes(to: $0, from: off..<(off + 2)) }
+                        return Int(v)
+                    case 4:
+                        var v: UInt32 = 0
+                        _ = withUnsafeMutableBytes(of: &v) { idxData.copyBytes(to: $0, from: off..<(off + 4)) }
+                        return Int(v)
+                    default:
+                        var v: UInt8 = 0
+                        _ = withUnsafeMutableBytes(of: &v) { idxData.copyBytes(to: $0, from: off..<(off + 1)) }
+                        return Int(v)
+                    }
+                }
+
+                for t in 0..<element.primitiveCount {
+                    let i0 = readIdx(t * 3), i1 = readIdx(t * 3 + 1), i2 = readIdx(t * 3 + 2)
+                    let v0 = readVec(vertexSource, i0)
+                    let v1 = readVec(vertexSource, i1)
+                    let v2 = readVec(vertexSource, i2)
+
+                    let n0: SIMD3<Float>, n1: SIMD3<Float>, n2: SIMD3<Float>
+                    if let ns = normalSource {
+                        n0 = readVec(ns, i0); n1 = readVec(ns, i1); n2 = readVec(ns, i2)
+                    } else {
+                        let fn = simd_normalize(simd_cross(v1 - v0, v2 - v0))
+                        n0 = fn; n1 = fn; n2 = fn
+                    }
+
+                    // Y in world space = localY + offsetY
+                    let wy0 = v0.y + offsetY, wy1 = v1.y + offsetY, wy2 = v2.y + offsetY
+                    triangles.append(TriangleData(
+                        vertices: [v0, v1, v2],
+                        normals: [n0, n1, n2],
+                        minY: min(wy0, wy1, wy2),
+                        maxY: max(wy0, wy1, wy2)
+                    ))
+                }
+            }
+
+            caches.append(NodeCache(
+                node: node,
+                originalGeometry: geometry,
+                triangles: triangles,
+                containerOffsetY: offsetY
+            ))
+        }
+    }
+
+    func applyClip(bottom: Float, top: Float) {
+        for cache in caches {
+            let filtered = cache.triangles.filter { tri in
+                tri.maxY >= bottom && tri.minY <= top
+            }
+
+            guard !filtered.isEmpty else {
+                // Hide node if nothing visible
+                cache.node.geometry = buildEmptyGeometry(materials: cache.originalGeometry.materials)
+                continue
+            }
+
+            var verts: [Float] = []
+            var norms: [Float] = []
+            verts.reserveCapacity(filtered.count * 9)
+            norms.reserveCapacity(filtered.count * 9)
+
+            for tri in filtered {
+                for i in 0..<3 {
+                    verts.append(contentsOf: [tri.vertices[i].x, tri.vertices[i].y, tri.vertices[i].z])
+                    norms.append(contentsOf: [tri.normals[i].x, tri.normals[i].y, tri.normals[i].z])
+                }
+            }
+
+            let vertexData = Data(bytes: verts, count: verts.count * MemoryLayout<Float>.size)
+            let normalData = Data(bytes: norms, count: norms.count * MemoryLayout<Float>.size)
+            let count = verts.count / 3
+
+            let vertexSource = SCNGeometrySource(
+                data: vertexData, semantic: .vertex, vectorCount: count,
+                usesFloatComponents: true, componentsPerVector: 3,
+                bytesPerComponent: 4, dataOffset: 0, dataStride: 12
+            )
+            let normalSource = SCNGeometrySource(
+                data: normalData, semantic: .normal, vectorCount: count,
+                usesFloatComponents: true, componentsPerVector: 3,
+                bytesPerComponent: 4, dataOffset: 0, dataStride: 12
+            )
+
+            var indices: [UInt32] = []
+            indices.reserveCapacity(count)
+            for i in 0..<count { indices.append(UInt32(i)) }
+            let indexData = Data(bytes: indices, count: indices.count * 4)
+            let element = SCNGeometryElement(
+                data: indexData, primitiveType: .triangles,
+                primitiveCount: count / 3, bytesPerIndex: 4
+            )
+
+            let newGeo = SCNGeometry(sources: [vertexSource, normalSource], elements: [element])
+            newGeo.materials = cache.originalGeometry.materials
+            cache.node.geometry = newGeo
+        }
+    }
+
+    func restore() {
+        for cache in caches {
+            cache.node.geometry = cache.originalGeometry
+        }
+        caches.removeAll()
+    }
+
+    private func buildEmptyGeometry(materials: [SCNMaterial]) -> SCNGeometry {
+        let geo = SCNGeometry(sources: [], elements: [])
+        geo.materials = materials
+        return geo
+    }
+}
+
 // MARK: - Main Screen
 
 struct ModelViewerScreen: View {
@@ -1149,6 +1269,7 @@ struct ModelViewerScreen: View {
     @State private var showClipSlider = false
     @State private var clipTop: Float = 1.0
     @State private var clipBottom: Float = 0.0
+    @State private var clipCache = ClipGeometryCache()
     @State private var showSideMenu = false
     @State private var dimensions: ModelDimensions?
     @State private var scaleX: Float = 1.0
@@ -1171,8 +1292,6 @@ struct ModelViewerScreen: View {
                     showGrid: showGrid,
                     modelScale: SIMD3(scaleX, scaleY, scaleZ),
                     faceSelectMode: isSelectingFace,
-                    clipYMin: showClipSlider ? clipBottom * (dimensions?.height ?? 0) : nil,
-                    clipYMax: showClipSlider ? clipTop * (dimensions?.height ?? 0) : nil,
                     onFaceSelected: { normal in
                         selectedFaceNormal = normal
                     }
@@ -1358,6 +1477,29 @@ struct ModelViewerScreen: View {
         .onAppear {
             loadModel()
         }
+        .onChange(of: showClipSlider) { _, active in
+            guard let scene else { return }
+            if active {
+                clipTop = 1.0
+                clipBottom = 0.0
+                clipCache.prepare(scene: scene)
+            } else {
+                clipCache.restore()
+            }
+        }
+        .onChange(of: clipTop) { _, _ in
+            updateClipping()
+        }
+        .onChange(of: clipBottom) { _, _ in
+            updateClipping()
+        }
+    }
+
+    private func updateClipping() {
+        guard showClipSlider, let dimensions else { return }
+        let bottom = clipBottom * dimensions.height
+        let top = clipTop * dimensions.height
+        clipCache.applyClip(bottom: bottom, top: top)
     }
 
     private var showResultBinding: Binding<Bool> {
