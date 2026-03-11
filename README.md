@@ -1,6 +1,6 @@
 # sliceApp
 
-Aplicación iOS enfocada en la preparación de archivos 3D para impresión en resina. Permite importar, visualizar, redimensionar, convertir y exportar modelos listos para laminar.
+Aplicación iOS enfocada en la preparación de archivos 3D para impresión en resina. Permite importar, visualizar, redimensionar, orientar, convertir y exportar modelos listos para laminar.
 
 ## Funcionalidades
 
@@ -16,17 +16,19 @@ Aplicación iOS enfocada en la preparación de archivos 3D para impresión en re
 - Iluminación tipo estudio: key light, fill light, rim light y ambient
 - Controles táctiles: rotar, zoom y pan
 - Materiales con sombreado Phong, reflejo specular y doble cara
-- Generación automática de normales para archivos que no las incluyen (archivos convertidos, exports de otros programas)
+- Generación automática de normales para archivos que no las incluyen
+- Modelo posicionado en cuadrante positivo (X+, Y+, Z+) con base en Y=0
 
 ### Cuadrícula y ejes
-- Plano XZ (piso) con cuadrícula que se adapta al tamaño del modelo
+- Cuadrícula XZ (piso) en cuadrante positivo, adaptada al tamaño del modelo
 - Ejes coloreados: **X** (rojo), **Y** (verde), **Z** (azul) con etiquetas
+- Marcas numéricas a lo largo de cada eje con valores de distancia
 - Esfera blanca en el origen (0,0,0)
 - Toggle para ocultar/mostrar desde el menú lateral
 
 ### Dimensiones
 - Barra inferior con dimensiones reales del modelo en mm por eje
-- Se actualiza en tiempo real al redimensionar
+- Se actualiza en tiempo real al redimensionar u orientar
 - Toggle para ocultar/mostrar
 
 ### Redimensionar y guardar
@@ -36,7 +38,13 @@ Aplicación iOS enfocada en la preparación de archivos 3D para impresión en re
 - **Guardar cambios**: aplica la escala directamente a los vértices del archivo
   - Recalcula normales con la transpuesta inversa para escalas no uniformes
   - Sobreescribe el archivo original con las nuevas dimensiones
-  - El archivo queda listo para pasar al slicer de resina con el tamaño correcto
+
+### Orientar base
+- Panel con controles de rotación independientes por eje (X, Y, Z)
+- Campo de texto para escribir grados exactos
+- Botones -/+ que rotan 5° por clic
+- **Seleccionar cara como base**: modo interactivo donde tocas una cara del modelo y se resalta la superficie plana completa; al confirmar, el modelo rota para que esa cara quede como base en Y=0
+- Los cambios de orientación se guardan automáticamente al archivo
 
 ### Conversión de formatos
 - Conversión nativa usando ModelIO de Apple
@@ -56,7 +64,8 @@ sliceApp/
 ├── ContentView.swift          # Vista principal
 ├── FileExplorerView.swift     # Explorador, importación y lista de archivos
 ├── ModelViewerView.swift      # Visualizador 3D, cuadrícula, ejes, dimensiones,
-│                              # panel de escala, guardado y menú lateral
+│                              # paneles de escala y orientación, selección de
+│                              # cara, guardado y menú lateral
 ├── STLParser.swift            # Parser de STL binario y ASCII con auto-normales
 ├── STLExporter.swift          # Exportador de SceneKit a STL binario
 ├── ModelConverter.swift       # Conversión entre formatos con ModelIO

@@ -139,9 +139,8 @@ nonisolated struct ModelConverter {
     private static func findMesh(in object: MDLObject) -> Bool {
         if object is MDLMesh { return true }
         for i in 0..<object.children.count {
-            if let child = object.children[i] as? MDLObject {
-                if findMesh(in: child) { return true }
-            }
+            let child = object.children[i]
+            if findMesh(in: child) { return true }
         }
         return false
     }

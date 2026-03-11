@@ -7,6 +7,12 @@ struct ModelViewerView: UIViewRepresentable {
     let scene: SCNScene
     let showGrid: Bool
     let modelScale: SIMD3<Float>
+    let faceSelectMode: Bool
+    var onFaceSelected: ((SIMD3<Float>) -> Void)?
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onFaceSelected: onFaceSelected)
+    }
 
     func makeUIView(context: Context) -> SCNView {
         let sceneView = SCNView()
@@ -15,6 +21,12 @@ struct ModelViewerView: UIViewRepresentable {
         sceneView.allowsCameraControl = true
         sceneView.antialiasingMode = .multisampling4X
         sceneView.scene = scene
+
+        let tap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleTap(_:)))
+        tap.isEnabled = faceSelectMode
+        sceneView.addGestureRecognizer(tap)
+        context.coordinator.tapGesture = tap
+        context.coordinator.sceneView = sceneView
 
         setupLighting(in: scene)
 
@@ -35,6 +47,215 @@ struct ModelViewerView: UIViewRepresentable {
         // Apply model scale
         if let modelNode = scene.rootNode.childNode(withName: "__model__", recursively: false) {
             modelNode.scale = SCNVector3(modelScale.x, modelScale.y, modelScale.z)
+        }
+
+        // Update face selection mode
+        context.coordinator.tapGesture?.isEnabled = faceSelectMode
+        context.coordinator.onFaceSelected = onFaceSelected
+
+        // Remove highlight when exiting select mode
+        if !faceSelectMode {
+            scene.rootNode.childNode(withName: "__face_highlight__", recursively: true)?.removeFromParentNode()
+        }
+    }
+
+    class Coordinator: NSObject {
+        var onFaceSelected: ((SIMD3<Float>) -> Void)?
+        weak var tapGesture: UITapGestureRecognizer?
+        weak var sceneView: SCNView?
+
+        init(onFaceSelected: ((SIMD3<Float>) -> Void)?) {
+            self.onFaceSelected = onFaceSelected
+        }
+
+        @objc func handleTap(_ gesture: UITapGestureRecognizer) {
+            guard let sceneView else { return }
+            let location = gesture.location(in: sceneView)
+            let hits = sceneView.hitTest(location, options: [
+                .searchMode: SCNHitTestSearchMode.closest.rawValue,
+                .firstFoundOnly: false
+            ])
+
+            // Find the first hit that's on the model (not grid/axes)
+            guard let hit = hits.first(where: { hit in
+                let name = hit.node.name ?? ""
+                return !name.hasPrefix("__")
+            }) else { return }
+
+            let faceNormal = getFaceNormal(hit: hit)
+
+            // Highlight the tapped face area
+            highlightFace(hit: hit, in: sceneView.scene!)
+
+            onFaceSelected?(faceNormal)
+        }
+
+        private func getFaceNormal(hit: SCNHitTestResult) -> SIMD3<Float> {
+            guard let geometry = hit.node.geometry,
+                  let vertexSource = geometry.sources(for: .vertex).first else {
+                // Fallback to hit world normal
+                let n = hit.worldNormal
+                return SIMD3(Float(n.x), Float(n.y), Float(n.z))
+            }
+
+            let faceIndex = hit.faceIndex
+            guard faceIndex >= 0 else {
+                let n = hit.worldNormal
+                return SIMD3(Float(n.x), Float(n.y), Float(n.z))
+            }
+
+            // Extract the triangle vertices to compute the face normal in local space
+            let data = vertexSource.data
+            let stride = vertexSource.dataStride
+            let offset = vertexSource.dataOffset
+            let vectorCount = vertexSource.vectorCount
+
+            func readVertex(_ idx: Int) -> SIMD3<Float> {
+                guard idx < vectorCount else { return .zero }
+                let base = offset + idx * stride
+                var x: Float = 0, y: Float = 0, z: Float = 0
+                _ = withUnsafeMutableBytes(of: &x) { data.copyBytes(to: $0, from: base..<(base + 4)) }
+                _ = withUnsafeMutableBytes(of: &y) { data.copyBytes(to: $0, from: (base + 4)..<(base + 8)) }
+                _ = withUnsafeMutableBytes(of: &z) { data.copyBytes(to: $0, from: (base + 8)..<(base + 12)) }
+                return SIMD3(x, y, z)
+            }
+
+            // Get indices for this face
+            for element in geometry.elements {
+                guard element.primitiveType == .triangles else { continue }
+                let bytesPerIndex = element.bytesPerIndex
+                let indexOffset = faceIndex * 3
+
+                func readIndex(_ i: Int) -> Int {
+                    let off = i * bytesPerIndex
+                    guard off + bytesPerIndex <= element.data.count else { return 0 }
+                    switch bytesPerIndex {
+                    case 2:
+                        var v: UInt16 = 0
+                        _ = withUnsafeMutableBytes(of: &v) { element.data.copyBytes(to: $0, from: off..<(off + 2)) }
+                        return Int(v)
+                    case 4:
+                        var v: UInt32 = 0
+                        _ = withUnsafeMutableBytes(of: &v) { element.data.copyBytes(to: $0, from: off..<(off + 4)) }
+                        return Int(v)
+                    default:
+                        var v: UInt8 = 0
+                        _ = withUnsafeMutableBytes(of: &v) { element.data.copyBytes(to: $0, from: off..<(off + 1)) }
+                        return Int(v)
+                    }
+                }
+
+                let i0 = readIndex(indexOffset)
+                let i1 = readIndex(indexOffset + 1)
+                let i2 = readIndex(indexOffset + 2)
+
+                let v0 = readVertex(i0), v1 = readVertex(i1), v2 = readVertex(i2)
+                let cross = simd_cross(v1 - v0, v2 - v0)
+                let len = simd_length(cross)
+                if len > 0 {
+                    return simd_normalize(cross)
+                }
+            }
+
+            let n = hit.worldNormal
+            return SIMD3(Float(n.x), Float(n.y), Float(n.z))
+        }
+
+        private func highlightFace(hit: SCNHitTestResult, in scene: SCNScene) {
+            // Remove previous highlight
+            scene.rootNode.childNode(withName: "__face_highlight__", recursively: true)?.removeFromParentNode()
+
+            guard let geometry = hit.node.geometry,
+                  let vertexSource = geometry.sources(for: .vertex).first,
+                  hit.faceIndex >= 0 else { return }
+
+            let data = vertexSource.data
+            let stride = vertexSource.dataStride
+            let offset = vertexSource.dataOffset
+            let vectorCount = vertexSource.vectorCount
+
+            func readVertex(_ idx: Int) -> SCNVector3 {
+                guard idx < vectorCount else { return SCNVector3Zero }
+                let base = offset + idx * stride
+                var x: Float = 0, y: Float = 0, z: Float = 0
+                _ = withUnsafeMutableBytes(of: &x) { data.copyBytes(to: $0, from: base..<(base + 4)) }
+                _ = withUnsafeMutableBytes(of: &y) { data.copyBytes(to: $0, from: (base + 4)..<(base + 8)) }
+                _ = withUnsafeMutableBytes(of: &z) { data.copyBytes(to: $0, from: (base + 8)..<(base + 12)) }
+                return SCNVector3(x, y, z)
+            }
+
+            // Find all coplanar adjacent faces (same normal) to highlight the whole flat surface
+            let hitNormal = getFaceNormal(hit: hit)
+            var highlightVertices: [SCNVector3] = []
+
+            for element in geometry.elements {
+                guard element.primitiveType == .triangles else { continue }
+                let bytesPerIndex = element.bytesPerIndex
+                let triCount = element.primitiveCount
+
+                func readIndex(_ i: Int) -> Int {
+                    let off = i * bytesPerIndex
+                    guard off + bytesPerIndex <= element.data.count else { return 0 }
+                    switch bytesPerIndex {
+                    case 2:
+                        var v: UInt16 = 0
+                        _ = withUnsafeMutableBytes(of: &v) { element.data.copyBytes(to: $0, from: off..<(off + 2)) }
+                        return Int(v)
+                    case 4:
+                        var v: UInt32 = 0
+                        _ = withUnsafeMutableBytes(of: &v) { element.data.copyBytes(to: $0, from: off..<(off + 4)) }
+                        return Int(v)
+                    default:
+                        var v: UInt8 = 0
+                        _ = withUnsafeMutableBytes(of: &v) { element.data.copyBytes(to: $0, from: off..<(off + 1)) }
+                        return Int(v)
+                    }
+                }
+
+                for t in 0..<triCount {
+                    let idx = t * 3
+                    let i0 = readIndex(idx), i1 = readIndex(idx + 1), i2 = readIndex(idx + 2)
+                    let v0s = readVertex(i0), v1s = readVertex(i1), v2s = readVertex(i2)
+                    let v0 = SIMD3<Float>(v0s.x, v0s.y, v0s.z)
+                    let v1 = SIMD3<Float>(v1s.x, v1s.y, v1s.z)
+                    let v2 = SIMD3<Float>(v2s.x, v2s.y, v2s.z)
+
+                    let c = simd_cross(v1 - v0, v2 - v0)
+                    let l = simd_length(c)
+                    guard l > 0 else { continue }
+                    let n = simd_normalize(c)
+
+                    if simd_dot(n, hitNormal) > 0.98 {
+                        highlightVertices.append(v0s)
+                        highlightVertices.append(v1s)
+                        highlightVertices.append(v2s)
+                    }
+                }
+            }
+
+            guard !highlightVertices.isEmpty else { return }
+
+            let src = SCNGeometrySource(vertices: highlightVertices)
+            let indices: [UInt32] = (0..<UInt32(highlightVertices.count)).map { $0 }
+            let indexData = Data(bytes: indices, count: indices.count * MemoryLayout<UInt32>.size)
+            let elem = SCNGeometryElement(
+                data: indexData,
+                primitiveType: .triangles,
+                primitiveCount: highlightVertices.count / 3,
+                bytesPerIndex: MemoryLayout<UInt32>.size
+            )
+
+            let hlGeo = SCNGeometry(sources: [src], elements: [elem])
+            let hlMat = SCNMaterial()
+            hlMat.diffuse.contents = UIColor.systemOrange.withAlphaComponent(0.6)
+            hlMat.lightingModel = .constant
+            hlMat.isDoubleSided = true
+            hlGeo.materials = [hlMat]
+
+            let hlNode = SCNNode(geometry: hlGeo)
+            hlNode.name = "__face_highlight__"
+            hlNode.renderingOrder = 10
+            hit.node.addChildNode(hlNode)
         }
     }
 
@@ -79,37 +300,32 @@ nonisolated struct SceneGridBuilder {
     static func buildGrid(for scene: SCNScene) -> SCNNode {
         let root = SCNNode()
 
-        // Calculate grid size based on model bounding box
-        let (sceneMin, sceneMax) = sceneBounds(scene)
-        let sizeX = sceneMax.x - sceneMin.x
-        let sizeY = sceneMax.y - sceneMin.y
-        let sizeZ = sceneMax.z - sceneMin.z
+        // Calculate grid size based on model bounding box (model is in positive quadrant)
+        let (_, sceneMax) = sceneBounds(scene)
+        let sizeX = sceneMax.x
+        let sizeY = sceneMax.y
+        let sizeZ = sceneMax.z
         let maxSize = max(sizeX, max(sizeY, sizeZ))
-        let gridExtent = ceilToNice(maxSize * 1.5)
-        let gridStep = ceilToNice(gridExtent / 10)
+        let gridExtent = ceilToNice(maxSize * 1.3)
+        let gridStep = niceStep(for: gridExtent)
 
-        // XZ plane grid (floor) at Y=0 (model base)
-        let floorGrid = buildPlaneGrid(
-            extent: gridExtent, step: gridStep,
+        // XZ plane grid (floor) at Y=0 — positive quadrant only
+        let floorGrid = buildPositiveGrid(
+            extentA: gridExtent, extentB: gridExtent, step: gridStep,
             axis1: SCNVector3(1, 0, 0), axis2: SCNVector3(0, 0, 1),
             color: UIColor(white: 0.35, alpha: 0.5)
         )
-        floorGrid.position = SCNVector3(0, 0, 0)
         root.addChildNode(floorGrid)
 
-        // Axes at origin (base of the model, centered XZ)
-        // Length proportional to model size
-        let axisLength = maxSize > 0 ? maxSize * 0.8 : gridExtent * 0.6
-        root.addChildNode(buildAxis(direction: SCNVector3(axisLength, 0, 0), color: .systemRed, label: "X"))
-        root.addChildNode(buildAxis(direction: SCNVector3(0, axisLength, 0), color: .systemGreen, label: "Y"))
-        root.addChildNode(buildAxis(direction: SCNVector3(0, 0, axisLength), color: .systemBlue, label: "Z"))
+        // Axes — positive direction only, extending past the model
+        let axisLength = gridExtent
+        root.addChildNode(buildAxis(direction: SCNVector3(axisLength, 0, 0), color: .systemRed, label: "X", step: gridStep))
+        root.addChildNode(buildAxis(direction: SCNVector3(0, axisLength, 0), color: .systemGreen, label: "Y", step: gridStep))
+        root.addChildNode(buildAxis(direction: SCNVector3(0, 0, axisLength), color: .systemBlue, label: "Z", step: gridStep))
 
-        // Negative axes (dashed/dimmer)
-        root.addChildNode(buildAxis(direction: SCNVector3(-axisLength, 0, 0), color: .systemRed.withAlphaComponent(0.3), label: ""))
-        root.addChildNode(buildAxis(direction: SCNVector3(0, 0, -axisLength), color: .systemBlue.withAlphaComponent(0.3), label: ""))
-
-        // Origin sphere at Y=0
-        let originGeo = SCNSphere(radius: Double(gridStep * 0.08))
+        // Origin sphere
+        let originRadius = max(Double(gridStep * 0.06), 0.3)
+        let originGeo = SCNSphere(radius: originRadius)
         let originMat = SCNMaterial()
         originMat.diffuse.contents = UIColor.white
         originMat.lightingModel = .constant
@@ -122,7 +338,6 @@ nonisolated struct SceneGridBuilder {
     }
 
     private static func sceneBounds(_ scene: SCNScene) -> (SCNVector3, SCNVector3) {
-        // Use the __model__ container bounds directly if available
         if let modelNode = scene.rootNode.childNode(withName: "__model__", recursively: false) {
             let (localMin, localMax) = modelNode.boundingBox
             let worldMin = modelNode.convertPosition(localMin, to: nil)
@@ -154,48 +369,43 @@ nonisolated struct SceneGridBuilder {
         }
 
         if !found {
-            return (SCNVector3(-5, -5, -5), SCNVector3(5, 5, 5))
+            return (SCNVector3(0, 0, 0), SCNVector3(5, 5, 5))
         }
         return (minB, maxB)
     }
 
-    private static func buildPlaneGrid(extent: Float, step: Float, axis1: SCNVector3, axis2: SCNVector3, color: UIColor) -> SCNNode {
+    /// Builds a grid on the positive side only (from 0 to extent along each axis)
+    private static func buildPositiveGrid(extentA: Float, extentB: Float, step: Float, axis1: SCNVector3, axis2: SCNVector3, color: UIColor) -> SCNNode {
         let node = SCNNode()
-        let halfExtent = extent / 2
-        let steps = Int(extent / step)
+        let stepsA = Int(extentA / step)
+        let stepsB = Int(extentB / step)
 
         var vertices: [SCNVector3] = []
 
-        for i in -steps...steps {
+        // Lines along axis2 direction (at each step along axis1)
+        for i in 0...stepsA {
             let offset = Float(i) * step
+            let start = SCNVector3(axis1.x * offset, axis1.y * offset, axis1.z * offset)
+            let end = SCNVector3(
+                axis1.x * offset + axis2.x * extentB,
+                axis1.y * offset + axis2.y * extentB,
+                axis1.z * offset + axis2.z * extentB
+            )
+            vertices.append(start)
+            vertices.append(end)
+        }
 
-            // Lines along axis2
-            let a1Start = SCNVector3(
-                axis1.x * offset - axis2.x * halfExtent,
-                axis1.y * offset - axis2.y * halfExtent,
-                axis1.z * offset - axis2.z * halfExtent
+        // Lines along axis1 direction (at each step along axis2)
+        for i in 0...stepsB {
+            let offset = Float(i) * step
+            let start = SCNVector3(axis2.x * offset, axis2.y * offset, axis2.z * offset)
+            let end = SCNVector3(
+                axis2.x * offset + axis1.x * extentA,
+                axis2.y * offset + axis1.y * extentA,
+                axis2.z * offset + axis1.z * extentA
             )
-            let a1End = SCNVector3(
-                axis1.x * offset + axis2.x * halfExtent,
-                axis1.y * offset + axis2.y * halfExtent,
-                axis1.z * offset + axis2.z * halfExtent
-            )
-            vertices.append(a1Start)
-            vertices.append(a1End)
-
-            // Lines along axis1
-            let a2Start = SCNVector3(
-                axis2.x * offset - axis1.x * halfExtent,
-                axis2.y * offset - axis1.y * halfExtent,
-                axis2.z * offset - axis1.z * halfExtent
-            )
-            let a2End = SCNVector3(
-                axis2.x * offset + axis1.x * halfExtent,
-                axis2.y * offset + axis1.y * halfExtent,
-                axis2.z * offset + axis1.z * halfExtent
-            )
-            vertices.append(a2Start)
-            vertices.append(a2End)
+            vertices.append(start)
+            vertices.append(end)
         }
 
         let source = SCNGeometrySource(vertices: vertices)
@@ -218,10 +428,10 @@ nonisolated struct SceneGridBuilder {
         return node
     }
 
-    private static func buildAxis(direction: SCNVector3, color: UIColor, label: String) -> SCNNode {
+    private static func buildAxis(direction: SCNVector3, color: UIColor, label: String, step: Float) -> SCNNode {
         let node = SCNNode()
 
-        // Line
+        // Axis line
         let vertices = [SCNVector3(0, 0, 0), direction]
         let source = SCNGeometrySource(vertices: vertices)
         let indices: [UInt32] = [0, 1]
@@ -238,12 +448,109 @@ nonisolated struct SceneGridBuilder {
         mat.diffuse.contents = color
         mat.lightingModel = .constant
         lineGeo.materials = [mat]
+        node.addChildNode(SCNNode(geometry: lineGeo))
 
-        let lineNode = SCNNode(geometry: lineGeo)
-        node.addChildNode(lineNode)
+        // Axis label at the end
+        let len = sqrt(direction.x * direction.x + direction.y * direction.y + direction.z * direction.z)
+        let labelScale = len * 0.05
+        node.addChildNode(buildTextNode(
+            string: label,
+            color: color,
+            scale: labelScale,
+            position: SCNVector3(direction.x * 1.05, direction.y * 1.05, direction.z * 1.05)
+        ))
 
-        // Label at end
-        let text = SCNText(string: label, extrusionDepth: 0.1)
+        // Numbered tick marks along the axis
+        let tickCount = Int(len / step)
+        let tickSize = len * 0.01
+        let numberScale = len * 0.03
+
+        for i in 1...tickCount {
+            let dist = Float(i) * step
+            let fraction = dist / len
+
+            // Tick mark position on the axis
+            let tickPos = SCNVector3(
+                direction.x * fraction,
+                direction.y * fraction,
+                direction.z * fraction
+            )
+
+            // Small perpendicular tick line
+            let tickNode = buildTickMark(at: tickPos, axis: direction, size: tickSize, color: color)
+            node.addChildNode(tickNode)
+
+            // Number label — format nicely
+            let value = dist
+            let numberStr: String
+            if value == Float(Int(value)) {
+                numberStr = String(Int(value))
+            } else if value * 10 == Float(Int(value * 10)) {
+                numberStr = String(format: "%.1f", value)
+            } else {
+                numberStr = String(format: "%.1f", value)
+            }
+
+            // Offset the number slightly away from the axis
+            var numberPos = tickPos
+            if abs(direction.x) > 0 {
+                numberPos.z -= tickSize * 3
+                numberPos.y -= tickSize * 2
+            } else if abs(direction.y) > 0 {
+                numberPos.x -= tickSize * 3
+            } else {
+                numberPos.x -= tickSize * 3
+                numberPos.y -= tickSize * 2
+            }
+
+            node.addChildNode(buildTextNode(
+                string: numberStr,
+                color: color.withAlphaComponent(0.7),
+                scale: numberScale,
+                position: numberPos
+            ))
+        }
+
+        return node
+    }
+
+    private static func buildTickMark(at position: SCNVector3, axis: SCNVector3, size: Float, color: UIColor) -> SCNNode {
+        // Create a small cross perpendicular to the axis direction
+        var p1 = position, p2 = position
+
+        if abs(axis.x) > 0 {
+            // X axis: tick in Y direction
+            p1.y -= size; p2.y += size
+        } else if abs(axis.y) > 0 {
+            // Y axis: tick in X direction
+            p1.x -= size; p2.x += size
+        } else {
+            // Z axis: tick in Y direction
+            p1.y -= size; p2.y += size
+        }
+
+        let verts = [p1, p2]
+        let source = SCNGeometrySource(vertices: verts)
+        let indices: [UInt32] = [0, 1]
+        let indexData = Data(bytes: indices, count: indices.count * MemoryLayout<UInt32>.size)
+        let element = SCNGeometryElement(
+            data: indexData,
+            primitiveType: .line,
+            primitiveCount: 1,
+            bytesPerIndex: MemoryLayout<UInt32>.size
+        )
+
+        let geo = SCNGeometry(sources: [source], elements: [element])
+        let mat = SCNMaterial()
+        mat.diffuse.contents = color
+        mat.lightingModel = .constant
+        geo.materials = [mat]
+
+        return SCNNode(geometry: geo)
+    }
+
+    private static func buildTextNode(string: String, color: UIColor, scale: Float, position: SCNVector3) -> SCNNode {
+        let text = SCNText(string: string, extrusionDepth: 0.1)
         text.font = UIFont.systemFont(ofSize: 1, weight: .bold)
         text.flatness = 0.1
         let textMat = SCNMaterial()
@@ -252,22 +559,14 @@ nonisolated struct SceneGridBuilder {
         text.materials = [textMat]
 
         let textNode = SCNNode(geometry: text)
-        let len = sqrt(direction.x * direction.x + direction.y * direction.y + direction.z * direction.z)
-        let scale = len * 0.06
         textNode.scale = SCNVector3(scale, scale, scale)
-        textNode.position = SCNVector3(
-            direction.x * 1.05,
-            direction.y * 1.05,
-            direction.z * 1.05
-        )
+        textNode.position = position
 
-        // Billboard constraint so label always faces camera
         let billboard = SCNBillboardConstraint()
         billboard.freeAxes = .all
         textNode.constraints = [billboard]
 
-        node.addChildNode(textNode)
-        return node
+        return textNode
     }
 
     private static func ceilToNice(_ value: Float) -> Float {
@@ -278,6 +577,13 @@ nonisolated struct SceneGridBuilder {
         if normalized <= 2 { return 2 * magnitude }
         if normalized <= 5 { return 5 * magnitude }
         return 10 * magnitude
+    }
+
+    /// Picks a nice round step size so we get ~5-10 ticks
+    private static func niceStep(for extent: Float) -> Float {
+        guard extent > 0 else { return 1 }
+        let rough = extent / 8
+        return ceilToNice(rough)
     }
 }
 
@@ -496,6 +802,158 @@ struct ScaleControlPanel: View {
     }
 }
 
+// MARK: - Base / Rotation Panel
+
+struct BaseControlPanel: View {
+    @Binding var degreesX: Float
+    @Binding var degreesY: Float
+    @Binding var degreesZ: Float
+    let isSelectingFace: Bool
+    let hasSelectedFace: Bool
+    let onRotateAxis: (SCNVector3, Float) -> Void
+    let onStartFaceSelect: () -> Void
+    let onConfirmBase: () -> Void
+    let onCancelSelect: () -> Void
+    let onClose: () -> Void
+
+    var body: some View {
+        VStack(spacing: 12) {
+            HStack {
+                Text("Orientar base")
+                    .font(.subheadline)
+                    .fontWeight(.semibold)
+                    .foregroundStyle(.white)
+                Spacer()
+                Button {
+                    onClose()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.title3)
+                        .foregroundStyle(.gray)
+                }
+            }
+
+            axisRotation(label: "X", color: .red, degrees: $degreesX, axis: SCNVector3(1, 0, 0))
+            axisRotation(label: "Y", color: .green, degrees: $degreesY, axis: SCNVector3(0, 1, 0))
+            axisRotation(label: "Z", color: .blue, degrees: $degreesZ, axis: SCNVector3(0, 0, 1))
+
+            Divider().overlay(Color.white.opacity(0.15)).padding(.vertical, 4)
+
+            if isSelectingFace {
+                Text("Toca una cara del modelo para seleccionarla como base")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .multilineTextAlignment(.center)
+
+                HStack(spacing: 10) {
+                    Button {
+                        onCancelSelect()
+                    } label: {
+                        Text("Cancelar")
+                            .font(.subheadline)
+                            .fontWeight(.medium)
+                            .foregroundStyle(.white)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 10)
+                            .background(Color.gray.opacity(0.5))
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                    }
+
+                    Button {
+                        onConfirmBase()
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "checkmark")
+                            Text("Aplicar")
+                        }
+                        .font(.subheadline)
+                        .fontWeight(.medium)
+                        .foregroundStyle(.white)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 10)
+                        .background(hasSelectedFace ? Color.orange.opacity(0.8) : Color.orange.opacity(0.3))
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                    }
+                    .disabled(!hasSelectedFace)
+                }
+            } else {
+                Button {
+                    onStartFaceSelect()
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: "hand.tap")
+                        Text("Seleccionar cara como base")
+                    }
+                    .font(.subheadline)
+                    .fontWeight(.medium)
+                    .foregroundStyle(.white)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 10)
+                    .background(Color.orange.opacity(0.8))
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                }
+            }
+        }
+        .padding(16)
+        .background(.ultraThinMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: 16))
+        .padding(.horizontal)
+    }
+
+    private func axisRotation(label: String, color: Color, degrees: Binding<Float>, axis: SCNVector3) -> some View {
+        HStack(spacing: 10) {
+            Text(label)
+                .font(.caption)
+                .fontWeight(.bold)
+                .foregroundStyle(color)
+                .frame(width: 16)
+
+            Button {
+                let newVal = degrees.wrappedValue - 5
+                degrees.wrappedValue = newVal
+                onRotateAxis(axis, -5)
+            } label: {
+                Image(systemName: "minus.circle.fill")
+                    .foregroundStyle(color)
+                    .font(.title3)
+            }
+            .disabled(isSelectingFace)
+
+            TextField("0", value: degrees, format: .number)
+                .font(.caption)
+                .monospacedDigit()
+                .foregroundStyle(.white)
+                .multilineTextAlignment(.center)
+                .keyboardType(.numbersAndPunctuation)
+                .frame(width: 60)
+                .padding(.vertical, 6)
+                .padding(.horizontal, 8)
+                .background(Color.white.opacity(0.1))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .onSubmit {
+                    onRotateAxis(axis, degrees.wrappedValue)
+                    degrees.wrappedValue = 0
+                }
+                .disabled(isSelectingFace)
+
+            Text("°")
+                .font(.caption)
+                .foregroundStyle(.white.opacity(0.6))
+
+            Button {
+                let newVal = degrees.wrappedValue + 5
+                degrees.wrappedValue = newVal
+                onRotateAxis(axis, 5)
+            } label: {
+                Image(systemName: "plus.circle.fill")
+                    .foregroundStyle(color)
+                    .font(.title3)
+            }
+            .disabled(isSelectingFace)
+        }
+    }
+}
+
 // MARK: - Main Screen
 
 struct ModelViewerScreen: View {
@@ -508,6 +966,12 @@ struct ModelViewerScreen: View {
     @State private var showGrid = true
     @State private var showDimensions = true
     @State private var showScalePanel = false
+    @State private var showBasePanel = false
+    @State private var isSelectingFace = false
+    @State private var selectedFaceNormal: SIMD3<Float>?
+    @State private var rotDegreesX: Float = 0
+    @State private var rotDegreesY: Float = 0
+    @State private var rotDegreesZ: Float = 0
     @State private var showSideMenu = false
     @State private var dimensions: ModelDimensions?
     @State private var scaleX: Float = 1.0
@@ -525,8 +989,16 @@ struct ModelViewerScreen: View {
             Color(UIColor(white: 0.12, alpha: 1.0)).ignoresSafeArea()
 
             if let scene {
-                ModelViewerView(scene: scene, showGrid: showGrid, modelScale: SIMD3(scaleX, scaleY, scaleZ))
-                    .ignoresSafeArea(edges: .bottom)
+                ModelViewerView(
+                    scene: scene,
+                    showGrid: showGrid,
+                    modelScale: SIMD3(scaleX, scaleY, scaleZ),
+                    faceSelectMode: isSelectingFace,
+                    onFaceSelected: { normal in
+                        selectedFaceNormal = normal
+                    }
+                )
+                .ignoresSafeArea(edges: .bottom)
             } else if let errorMessage {
                 VStack(spacing: 12) {
                     Image(systemName: "exclamationmark.triangle")
@@ -547,6 +1019,37 @@ struct ModelViewerScreen: View {
             if scene != nil {
                 VStack {
                     Spacer()
+                    if showBasePanel {
+                        BaseControlPanel(
+                            degreesX: $rotDegreesX,
+                            degreesY: $rotDegreesY,
+                            degreesZ: $rotDegreesZ,
+                            isSelectingFace: isSelectingFace,
+                            hasSelectedFace: selectedFaceNormal != nil,
+                            onRotateAxis: { axis, degrees in
+                                rotateModel(axis: axis, degrees: degrees)
+                            },
+                            onStartFaceSelect: {
+                                isSelectingFace = true
+                                selectedFaceNormal = nil
+                            },
+                            onConfirmBase: {
+                                applySelectedFaceAsBase()
+                            },
+                            onCancelSelect: {
+                                isSelectingFace = false
+                                selectedFaceNormal = nil
+                            },
+                            onClose: {
+                                withAnimation(.easeInOut(duration: 0.25)) {
+                                    showBasePanel = false
+                                    isSelectingFace = false
+                                    selectedFaceNormal = nil
+                                }
+                            }
+                        )
+                        .padding(.bottom, 4)
+                    }
                     if showScalePanel {
                         ScaleControlPanel(
                             scaleX: $scaleX,
@@ -599,6 +1102,7 @@ struct ModelViewerScreen: View {
                         showGrid: $showGrid,
                         showDimensions: $showDimensions,
                         showScalePanel: $showScalePanel,
+                        showBasePanel: $showBasePanel,
                         availableFormats: availableFormats,
                         isConverting: isConverting,
                         onConvert: { format in
@@ -773,6 +1277,234 @@ struct ModelViewerScreen: View {
         isSaving = false
     }
 
+    /// Saves the current model geometry to the original file
+    private func saveCurrentGeometry() {
+        guard let scene else { return }
+        do {
+            let ext = fileURL.pathExtension.lowercased()
+            let exportScene = SCNScene()
+            if let modelNode = scene.rootNode.childNode(withName: "__model__", recursively: false) {
+                let clone = modelNode.clone()
+                clone.scale = SCNVector3(1, 1, 1)
+                exportScene.rootNode.addChildNode(clone)
+            }
+
+            switch ext {
+            case "stl":
+                try STLExporter.export(scene: exportScene, to: fileURL)
+            case "obj":
+                let tempSTL = fileURL.deletingLastPathComponent()
+                    .appendingPathComponent("__temp_export__.stl")
+                try STLExporter.export(scene: exportScene, to: tempSTL)
+                let outputURL = try ModelConverter.convert(inputURL: tempSTL, to: .obj)
+                if FileManager.default.fileExists(atPath: fileURL.path) {
+                    try FileManager.default.removeItem(at: fileURL)
+                }
+                try FileManager.default.moveItem(at: outputURL, to: fileURL)
+                try? FileManager.default.removeItem(at: tempSTL)
+            default:
+                try STLExporter.export(scene: exportScene, to: fileURL)
+            }
+        } catch {
+            saveResult = ConversionResult(
+                isSuccess: false,
+                message: error.localizedDescription
+            )
+        }
+    }
+
+    /// Rotates the model by given degrees around the axis, repositions to positive quadrant, and rebuilds grid
+    private func rotateModel(axis: SCNVector3, degrees: Float) {
+        guard let scene else { return }
+        guard let modelNode = scene.rootNode.childNode(withName: "__model__", recursively: false) else { return }
+        guard degrees != 0 else { return }
+
+        let angle = degrees * Float.pi / 180
+
+        // Apply rotation to all child geometry vertices directly
+        modelNode.enumerateChildNodes { node, _ in
+            guard let geometry = node.geometry else { return }
+            if let rotated = rotateGeometry(geometry, axis: SIMD3(axis.x, axis.y, axis.z), angle: angle) {
+                node.geometry = rotated
+            }
+        }
+
+        // Reposition so min corner is at origin
+        let (minB, _) = modelNode.boundingBox
+        modelNode.position = SCNVector3(-minB.x, -minB.y, -minB.z)
+
+        // Rebuild grid
+        let gridName = "__grid_root__"
+        if let oldGrid = scene.rootNode.childNode(withName: gridName, recursively: false) {
+            oldGrid.removeFromParentNode()
+        }
+        if showGrid {
+            let gridNode = SceneGridBuilder.buildGrid(for: scene)
+            gridNode.name = gridName
+            scene.rootNode.addChildNode(gridNode)
+        }
+
+        // Update dimensions
+        dimensions = ModelDimensions.compute(from: scene)
+
+        // Save rotation to file
+        saveCurrentGeometry()
+    }
+
+    /// Rotates the model so the selected face normal points down (-Y), making it the base
+    private func applySelectedFaceAsBase() {
+        guard let scene else { return }
+        guard let faceNormal = selectedFaceNormal else { return }
+        guard let modelNode = scene.rootNode.childNode(withName: "__model__", recursively: false) else { return }
+
+        // Remove highlight
+        scene.rootNode.childNode(withName: "__face_highlight__", recursively: true)?.removeFromParentNode()
+
+        // Compute rotation to align this normal with -Y (face down = base)
+        let targetDown = SIMD3<Float>(0, -1, 0)
+        let dot = simd_dot(faceNormal, targetDown)
+
+        if dot > 0.999 {
+            // Already aligned as base
+            isSelectingFace = false
+            selectedFaceNormal = nil
+            return
+        }
+
+        let rotationAxis: SIMD3<Float>
+        let rotationAngle: Float
+
+        if dot < -0.999 {
+            rotationAxis = SIMD3<Float>(1, 0, 0)
+            rotationAngle = Float.pi
+        } else {
+            rotationAxis = simd_normalize(simd_cross(faceNormal, targetDown))
+            rotationAngle = acos(max(-1, min(1, dot)))
+        }
+
+        // Apply rotation to all geometry
+        modelNode.enumerateChildNodes { node, _ in
+            guard let geometry = node.geometry else { return }
+            if let rotated = rotateGeometry(geometry, axis: rotationAxis, angle: rotationAngle) {
+                node.geometry = rotated
+            }
+        }
+
+        // Reposition to positive quadrant
+        let (minB, _) = modelNode.boundingBox
+        modelNode.position = SCNVector3(-minB.x, -minB.y, -minB.z)
+
+        // Rebuild grid
+        let gridName = "__grid_root__"
+        if let oldGrid = scene.rootNode.childNode(withName: gridName, recursively: false) {
+            oldGrid.removeFromParentNode()
+        }
+        if showGrid {
+            let gridNode = SceneGridBuilder.buildGrid(for: scene)
+            gridNode.name = gridName
+            scene.rootNode.addChildNode(gridNode)
+        }
+
+        dimensions = ModelDimensions.compute(from: scene)
+        isSelectingFace = false
+        selectedFaceNormal = nil
+
+        // Save rotation to file
+        saveCurrentGeometry()
+    }
+
+    /// Rotates geometry vertices and normals by angle around axis
+    private func rotateGeometry(_ geometry: SCNGeometry, axis: SIMD3<Float>, angle: Float) -> SCNGeometry? {
+        guard let vertexSource = geometry.sources(for: .vertex).first else { return nil }
+
+        let data = vertexSource.data
+        let vectorCount = vertexSource.vectorCount
+        let stride = vertexSource.dataStride
+        let offset = vertexSource.dataOffset
+
+        // Build rotation matrix using Rodrigues' formula
+        let c = cos(angle), s = sin(angle), t = 1 - c
+        let ax = axis.x, ay = axis.y, az = axis.z
+        // Row-major rotation matrix
+        let r00 = t * ax * ax + c,     r01 = t * ax * ay - s * az, r02 = t * ax * az + s * ay
+        let r10 = t * ax * ay + s * az, r11 = t * ay * ay + c,     r12 = t * ay * az - s * ax
+        let r20 = t * ax * az - s * ay, r21 = t * ay * az + s * ax, r22 = t * az * az + c
+
+        var newVertices: [Float] = []
+        newVertices.reserveCapacity(vectorCount * 3)
+
+        for i in 0..<vectorCount {
+            let base = offset + i * stride
+            var x: Float = 0, y: Float = 0, z: Float = 0
+            _ = withUnsafeMutableBytes(of: &x) { data.copyBytes(to: $0, from: base..<(base + 4)) }
+            _ = withUnsafeMutableBytes(of: &y) { data.copyBytes(to: $0, from: (base + 4)..<(base + 8)) }
+            _ = withUnsafeMutableBytes(of: &z) { data.copyBytes(to: $0, from: (base + 8)..<(base + 12)) }
+
+            newVertices.append(r00 * x + r01 * y + r02 * z)
+            newVertices.append(r10 * x + r11 * y + r12 * z)
+            newVertices.append(r20 * x + r21 * y + r22 * z)
+        }
+
+        let vertexData = Data(bytes: newVertices, count: newVertices.count * MemoryLayout<Float>.size)
+        let newVertexSource = SCNGeometrySource(
+            data: vertexData,
+            semantic: .vertex,
+            vectorCount: vectorCount,
+            usesFloatComponents: true,
+            componentsPerVector: 3,
+            bytesPerComponent: MemoryLayout<Float>.size,
+            dataOffset: 0,
+            dataStride: MemoryLayout<Float>.size * 3
+        )
+
+        var sources = [newVertexSource]
+
+        // Rotate normals too
+        if let normalSource = geometry.sources(for: .normal).first {
+            let nData = normalSource.data
+            let nStride = normalSource.dataStride
+            let nOffset = normalSource.dataOffset
+            var newNormals: [Float] = []
+            newNormals.reserveCapacity(vectorCount * 3)
+
+            for i in 0..<vectorCount {
+                let base = nOffset + i * nStride
+                var nx: Float = 0, ny: Float = 0, nz: Float = 0
+                _ = withUnsafeMutableBytes(of: &nx) { nData.copyBytes(to: $0, from: base..<(base + 4)) }
+                _ = withUnsafeMutableBytes(of: &ny) { nData.copyBytes(to: $0, from: (base + 4)..<(base + 8)) }
+                _ = withUnsafeMutableBytes(of: &nz) { nData.copyBytes(to: $0, from: (base + 8)..<(base + 12)) }
+
+                let rnx = r00 * nx + r01 * ny + r02 * nz
+                let rny = r10 * nx + r11 * ny + r12 * nz
+                let rnz = r20 * nx + r21 * ny + r22 * nz
+                let len = sqrt(rnx * rnx + rny * rny + rnz * rnz)
+                if len > 0 {
+                    newNormals.append(contentsOf: [rnx / len, rny / len, rnz / len])
+                } else {
+                    newNormals.append(contentsOf: [0, 0, 1])
+                }
+            }
+
+            let normalData = Data(bytes: newNormals, count: newNormals.count * MemoryLayout<Float>.size)
+            sources.append(SCNGeometrySource(
+                data: normalData,
+                semantic: .normal,
+                vectorCount: vectorCount,
+                usesFloatComponents: true,
+                componentsPerVector: 3,
+                bytesPerComponent: MemoryLayout<Float>.size,
+                dataOffset: 0,
+                dataStride: MemoryLayout<Float>.size * 3
+            ))
+        }
+
+        sources.append(contentsOf: geometry.sources(for: .texcoord))
+
+        let newGeo = SCNGeometry(sources: sources, elements: geometry.elements.map { $0 })
+        newGeo.materials = geometry.materials
+        return newGeo
+    }
+
     /// Applies scale directly to geometry vertices
     private func scaleGeometry(_ geometry: SCNGeometry, by scale: SCNVector3) -> SCNGeometry? {
         guard let vertexSource = geometry.sources(for: .vertex).first else { return nil }
@@ -788,9 +1520,9 @@ struct ModelViewerScreen: View {
         for i in 0..<vectorCount {
             let base = offset + i * stride
             var x: Float = 0, y: Float = 0, z: Float = 0
-            withUnsafeMutableBytes(of: &x) { data.copyBytes(to: $0, from: base..<(base + 4)) }
-            withUnsafeMutableBytes(of: &y) { data.copyBytes(to: $0, from: (base + 4)..<(base + 8)) }
-            withUnsafeMutableBytes(of: &z) { data.copyBytes(to: $0, from: (base + 8)..<(base + 12)) }
+            _ = withUnsafeMutableBytes(of: &x) { data.copyBytes(to: $0, from: base..<(base + 4)) }
+            _ = withUnsafeMutableBytes(of: &y) { data.copyBytes(to: $0, from: (base + 4)..<(base + 8)) }
+            _ = withUnsafeMutableBytes(of: &z) { data.copyBytes(to: $0, from: (base + 8)..<(base + 12)) }
 
             scaledVertices.append(x * scale.x)
             scaledVertices.append(y * scale.y)
@@ -825,9 +1557,9 @@ struct ModelViewerScreen: View {
                 for i in 0..<vectorCount {
                     let base = nOffset + i * nStride
                     var nx: Float = 0, ny: Float = 0, nz: Float = 0
-                    withUnsafeMutableBytes(of: &nx) { nData.copyBytes(to: $0, from: base..<(base + 4)) }
-                    withUnsafeMutableBytes(of: &ny) { nData.copyBytes(to: $0, from: (base + 4)..<(base + 8)) }
-                    withUnsafeMutableBytes(of: &nz) { nData.copyBytes(to: $0, from: (base + 8)..<(base + 12)) }
+                    _ = withUnsafeMutableBytes(of: &nx) { nData.copyBytes(to: $0, from: base..<(base + 4)) }
+                    _ = withUnsafeMutableBytes(of: &ny) { nData.copyBytes(to: $0, from: (base + 4)..<(base + 8)) }
+                    _ = withUnsafeMutableBytes(of: &nz) { nData.copyBytes(to: $0, from: (base + 8)..<(base + 12)) }
 
                     let snx = nx * invScale.x
                     let sny = ny * invScale.y
@@ -903,32 +1635,30 @@ struct ModelViewerScreen: View {
         let modelNode = SCNNode(geometry: geometry)
         let (minBound, maxBound) = modelNode.boundingBox
 
-        // Center XZ, put base on Y=0
-        let centerX = (minBound.x + maxBound.x) / 2
-        let centerZ = (minBound.z + maxBound.z) / 2
-        modelNode.position = SCNVector3(-centerX, -minBound.y, -centerZ)
+        // Move model so its min corner is at origin (0,0,0) — fully in positive quadrant
+        modelNode.position = SCNVector3(-minBound.x, -minBound.y, -minBound.z)
 
         let containerNode = SCNNode()
         containerNode.name = "__model__"
         containerNode.addChildNode(modelNode)
         scene.rootNode.addChildNode(containerNode)
 
-        let cameraNode = SCNNode()
-        cameraNode.camera = SCNCamera()
         let sizeX = maxBound.x - minBound.x
         let sizeY = maxBound.y - minBound.y
         let sizeZ = maxBound.z - minBound.z
         let maxDimension = max(sizeX, max(sizeY, sizeZ))
         let distance = maxDimension > 0 ? maxDimension * 2.5 : 10
-        // Camera looking at center of model height
-        cameraNode.position = SCNVector3(0, sizeY / 2, distance)
+
+        let cameraNode = SCNNode()
+        cameraNode.camera = SCNCamera()
+        cameraNode.position = SCNVector3(sizeX / 2, sizeY / 2, distance)
         cameraNode.camera?.automaticallyAdjustsZRange = true
         scene.rootNode.addChildNode(cameraNode)
 
         return scene
     }
 
-    /// Wraps all scene content in a named container node and repositions so base sits on Y=0
+    /// Wraps all scene content in a named container node and repositions to positive quadrant
     private func wrapModelNodes(in scene: SCNScene) {
         let container = SCNNode()
         container.name = "__model__"
@@ -938,17 +1668,12 @@ struct ModelViewerScreen: View {
             container.addChildNode(child)
         }
 
-        // Calculate bounds of all geometry in the container
+        // Move so min corner is at origin — fully in positive quadrant
         let (minB, maxB) = container.boundingBox
-        let centerX = (minB.x + maxB.x) / 2
-        let centerZ = (minB.z + maxB.z) / 2
-
-        // Offset so base is on Y=0 and centered on XZ
-        container.position = SCNVector3(-centerX, -minB.y, -centerZ)
+        container.position = SCNVector3(-minB.x, -minB.y, -minB.z)
 
         scene.rootNode.addChildNode(container)
 
-        // Add camera
         let sizeX = maxB.x - minB.x
         let sizeY = maxB.y - minB.y
         let sizeZ = maxB.z - minB.z
@@ -957,7 +1682,7 @@ struct ModelViewerScreen: View {
 
         let cameraNode = SCNNode()
         cameraNode.camera = SCNCamera()
-        cameraNode.position = SCNVector3(0, sizeY / 2, distance)
+        cameraNode.position = SCNVector3(sizeX / 2, sizeY / 2, distance)
         cameraNode.camera?.automaticallyAdjustsZRange = true
         scene.rootNode.addChildNode(cameraNode)
     }
@@ -1012,9 +1737,9 @@ struct ModelViewerScreen: View {
         for i in 0..<vectorCount {
             let base = offset + i * stride
             var x: Float = 0, y: Float = 0, z: Float = 0
-            withUnsafeMutableBytes(of: &x) { vertices.copyBytes(to: $0, from: base..<(base + 4)) }
-            withUnsafeMutableBytes(of: &y) { vertices.copyBytes(to: $0, from: (base + 4)..<(base + 8)) }
-            withUnsafeMutableBytes(of: &z) { vertices.copyBytes(to: $0, from: (base + 8)..<(base + 12)) }
+            _ = withUnsafeMutableBytes(of: &x) { vertices.copyBytes(to: $0, from: base..<(base + 4)) }
+            _ = withUnsafeMutableBytes(of: &y) { vertices.copyBytes(to: $0, from: (base + 4)..<(base + 8)) }
+            _ = withUnsafeMutableBytes(of: &z) { vertices.copyBytes(to: $0, from: (base + 8)..<(base + 12)) }
             positions.append((x, y, z))
         }
 
@@ -1094,15 +1819,15 @@ struct ModelViewerScreen: View {
             switch bytesPerIndex {
             case 1:
                 var v: UInt8 = 0
-                withUnsafeMutableBytes(of: &v) { data.copyBytes(to: $0, from: offset..<(offset + 1)) }
+                _ = withUnsafeMutableBytes(of: &v) { data.copyBytes(to: $0, from: offset..<(offset + 1)) }
                 indices.append(Int(v))
             case 2:
                 var v: UInt16 = 0
-                withUnsafeMutableBytes(of: &v) { data.copyBytes(to: $0, from: offset..<(offset + 2)) }
+                _ = withUnsafeMutableBytes(of: &v) { data.copyBytes(to: $0, from: offset..<(offset + 2)) }
                 indices.append(Int(v))
             case 4:
                 var v: UInt32 = 0
-                withUnsafeMutableBytes(of: &v) { data.copyBytes(to: $0, from: offset..<(offset + 4)) }
+                _ = withUnsafeMutableBytes(of: &v) { data.copyBytes(to: $0, from: offset..<(offset + 4)) }
                 indices.append(Int(v))
             default: break
             }
@@ -1117,6 +1842,7 @@ struct SideMenuView: View {
     @Binding var showGrid: Bool
     @Binding var showDimensions: Bool
     @Binding var showScalePanel: Bool
+    @Binding var showBasePanel: Bool
     let availableFormats: [ModelConverter.OutputFormat]
     let isConverting: Bool
     let onConvert: (ModelConverter.OutputFormat) -> Void
@@ -1172,6 +1898,18 @@ struct SideMenuView: View {
                     ) {
                         withAnimation(.easeInOut(duration: 0.25)) {
                             showScalePanel.toggle()
+                        }
+                        onClose()
+                    }
+
+                    menuButton(
+                        icon: showBasePanel ? "rotate.3d.fill" : "rotate.3d",
+                        title: "Orientar base",
+                        subtitle: showBasePanel ? "Panel abierto" : nil,
+                        highlighted: showBasePanel
+                    ) {
+                        withAnimation(.easeInOut(duration: 0.25)) {
+                            showBasePanel.toggle()
                         }
                         onClose()
                     }

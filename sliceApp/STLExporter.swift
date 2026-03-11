@@ -134,21 +134,21 @@ nonisolated struct STLExporter {
             var z: Float = 0
 
             if source.usesFloatComponents && bytesPerComponent == 4 {
-                withUnsafeMutableBytes(of: &x) { data.copyBytes(to: $0, from: baseOffset..<(baseOffset + 4)) }
+                _ = withUnsafeMutableBytes(of: &x) { data.copyBytes(to: $0, from: baseOffset..<(baseOffset + 4)) }
                 if componentsPerVector > 1 {
-                    withUnsafeMutableBytes(of: &y) { data.copyBytes(to: $0, from: (baseOffset + 4)..<(baseOffset + 8)) }
+                    _ = withUnsafeMutableBytes(of: &y) { data.copyBytes(to: $0, from: (baseOffset + 4)..<(baseOffset + 8)) }
                 }
                 if componentsPerVector > 2 {
-                    withUnsafeMutableBytes(of: &z) { data.copyBytes(to: $0, from: (baseOffset + 8)..<(baseOffset + 12)) }
+                    _ = withUnsafeMutableBytes(of: &z) { data.copyBytes(to: $0, from: (baseOffset + 8)..<(baseOffset + 12)) }
                 }
             } else if bytesPerComponent == 8 {
                 var dx: Double = 0, dy: Double = 0, dz: Double = 0
-                withUnsafeMutableBytes(of: &dx) { data.copyBytes(to: $0, from: baseOffset..<(baseOffset + 8)) }
+                _ = withUnsafeMutableBytes(of: &dx) { data.copyBytes(to: $0, from: baseOffset..<(baseOffset + 8)) }
                 if componentsPerVector > 1 {
-                    withUnsafeMutableBytes(of: &dy) { data.copyBytes(to: $0, from: (baseOffset + 8)..<(baseOffset + 16)) }
+                    _ = withUnsafeMutableBytes(of: &dy) { data.copyBytes(to: $0, from: (baseOffset + 8)..<(baseOffset + 16)) }
                 }
                 if componentsPerVector > 2 {
-                    withUnsafeMutableBytes(of: &dz) { data.copyBytes(to: $0, from: (baseOffset + 16)..<(baseOffset + 24)) }
+                    _ = withUnsafeMutableBytes(of: &dz) { data.copyBytes(to: $0, from: (baseOffset + 16)..<(baseOffset + 24)) }
                 }
                 x = Float(dx); y = Float(dy); z = Float(dz)
             }
@@ -184,15 +184,15 @@ nonisolated struct STLExporter {
             switch bytesPerIndex {
             case 1:
                 var value: UInt8 = 0
-                withUnsafeMutableBytes(of: &value) { data.copyBytes(to: $0, from: offset..<(offset + 1)) }
+                _ = withUnsafeMutableBytes(of: &value) { data.copyBytes(to: $0, from: offset..<(offset + 1)) }
                 indices.append(Int(value))
             case 2:
                 var value: UInt16 = 0
-                withUnsafeMutableBytes(of: &value) { data.copyBytes(to: $0, from: offset..<(offset + 2)) }
+                _ = withUnsafeMutableBytes(of: &value) { data.copyBytes(to: $0, from: offset..<(offset + 2)) }
                 indices.append(Int(value))
             case 4:
                 var value: UInt32 = 0
-                withUnsafeMutableBytes(of: &value) { data.copyBytes(to: $0, from: offset..<(offset + 4)) }
+                _ = withUnsafeMutableBytes(of: &value) { data.copyBytes(to: $0, from: offset..<(offset + 4)) }
                 indices.append(Int(value))
             default:
                 break

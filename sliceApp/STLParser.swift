@@ -245,8 +245,8 @@ nonisolated struct STLParser {
     }
 }
 
-private extension String {
-    func trimmedPrefix() -> String {
+extension String {
+    nonisolated func trimmedPrefix() -> String {
         trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
