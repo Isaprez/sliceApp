@@ -1115,46 +1115,48 @@ class ClipGeometryCache {
             func readVec(_ src: SCNGeometrySource, _ idx: Int) -> SIMD3<Float> {
                 guard idx < src.vectorCount else { return .zero }
                 let base = src.dataOffset + idx * src.dataStride
+                let bpc = src.bytesPerComponent
                 var x: Float = 0, y: Float = 0, z: Float = 0
-                _ = withUnsafeMutableBytes(of: &x) { src.data.copyBytes(to: $0, from: base..<(base + 4)) }
-                _ = withUnsafeMutableBytes(of: &y) { src.data.copyBytes(to: $0, from: (base + 4)..<(base + 8)) }
-                _ = withUnsafeMutableBytes(of: &z) { src.data.copyBytes(to: $0, from: (base + 8)..<(base + 12)) }
+                if bpc == 8 {
+                    // Double components
+                    var dx: Double = 0, dy: Double = 0, dz: Double = 0
+                    _ = withUnsafeMutableBytes(of: &dx) { src.data.copyBytes(to: $0, from: base..<(base + 8)) }
+                    _ = withUnsafeMutableBytes(of: &dy) { src.data.copyBytes(to: $0, from: (base + 8)..<(base + 16)) }
+                    _ = withUnsafeMutableBytes(of: &dz) { src.data.copyBytes(to: $0, from: (base + 16)..<(base + 24)) }
+                    x = Float(dx); y = Float(dy); z = Float(dz)
+                } else {
+                    // Float components (default)
+                    _ = withUnsafeMutableBytes(of: &x) { src.data.copyBytes(to: $0, from: base..<(base + 4)) }
+                    _ = withUnsafeMutableBytes(of: &y) { src.data.copyBytes(to: $0, from: (base + 4)..<(base + 8)) }
+                    _ = withUnsafeMutableBytes(of: &z) { src.data.copyBytes(to: $0, from: (base + 8)..<(base + 12)) }
+                }
                 return SIMD3(x, y, z)
             }
 
             var triangles: [TriangleData] = []
 
             for element in geometry.elements {
-                guard element.primitiveType == .triangles || element.primitiveType == .triangleStrip else { continue }
+                let primType = element.primitiveType
+                guard primType == .triangles || primType == .triangleStrip || primType == .polygon else { continue }
                 let idxData = element.data
                 let bpi = element.bytesPerIndex
 
-                func readIdx(_ i: Int) -> Int {
-                    let off = i * bpi
-                    guard off + bpi <= idxData.count else { return 0 }
+                func readIdx(_ byteOffset: Int) -> Int {
+                    guard byteOffset + bpi <= idxData.count else { return 0 }
                     switch bpi {
                     case 2:
                         var v: UInt16 = 0
-                        _ = withUnsafeMutableBytes(of: &v) { idxData.copyBytes(to: $0, from: off..<(off + 2)) }
+                        _ = withUnsafeMutableBytes(of: &v) { idxData.copyBytes(to: $0, from: byteOffset..<(byteOffset + 2)) }
                         return Int(v)
                     case 4:
                         var v: UInt32 = 0
-                        _ = withUnsafeMutableBytes(of: &v) { idxData.copyBytes(to: $0, from: off..<(off + 4)) }
+                        _ = withUnsafeMutableBytes(of: &v) { idxData.copyBytes(to: $0, from: byteOffset..<(byteOffset + 4)) }
                         return Int(v)
                     default:
                         var v: UInt8 = 0
-                        _ = withUnsafeMutableBytes(of: &v) { idxData.copyBytes(to: $0, from: off..<(off + 1)) }
+                        _ = withUnsafeMutableBytes(of: &v) { idxData.copyBytes(to: $0, from: byteOffset..<(byteOffset + 1)) }
                         return Int(v)
                     }
-                }
-
-                // Read total index count based on primitive type
-                let totalIndices: Int
-                if element.primitiveType == .triangles {
-                    totalIndices = element.primitiveCount * 3
-                } else {
-                    // Triangle strip: primitiveCount triangles = primitiveCount + 2 indices
-                    totalIndices = element.primitiveCount + 2
                 }
 
                 func addTriangle(_ i0: Int, _ i1: Int, _ i2: Int) {
@@ -1179,25 +1181,45 @@ class ClipGeometryCache {
                     ))
                 }
 
-                if element.primitiveType == .triangles {
+                if primType == .triangles {
                     for t in 0..<element.primitiveCount {
-                        let i0 = readIdx(t * 3), i1 = readIdx(t * 3 + 1), i2 = readIdx(t * 3 + 2)
+                        let i0 = readIdx(t * 3 * bpi), i1 = readIdx((t * 3 + 1) * bpi), i2 = readIdx((t * 3 + 2) * bpi)
                         addTriangle(i0, i1, i2)
                     }
-                } else {
-                    // Triangle strip
+                } else if primType == .triangleStrip {
+                    let totalIndices = element.primitiveCount + 2
                     guard totalIndices >= 3 else { continue }
                     for i in 0..<(totalIndices - 2) {
-                        let idx0 = readIdx(i)
+                        let idx0 = readIdx(i * bpi)
                         let idx1: Int, idx2: Int
                         if i % 2 == 0 {
-                            idx1 = readIdx(i + 1)
-                            idx2 = readIdx(i + 2)
+                            idx1 = readIdx((i + 1) * bpi)
+                            idx2 = readIdx((i + 2) * bpi)
                         } else {
-                            idx1 = readIdx(i + 2)
-                            idx2 = readIdx(i + 1)
+                            idx1 = readIdx((i + 2) * bpi)
+                            idx2 = readIdx((i + 1) * bpi)
                         }
                         addTriangle(idx0, idx1, idx2)
+                    }
+                } else if primType == .polygon {
+                    // Polygon data: [vertCount, idx0, idx1, ..., vertCount, idx0, ...]
+                    // Fan-triangulate each polygon
+                    var bytePos = 0
+                    for _ in 0..<element.primitiveCount {
+                        let vertCount = readIdx(bytePos)
+                        bytePos += bpi
+                        guard vertCount >= 3 else {
+                            bytePos += vertCount * bpi
+                            continue
+                        }
+                        let firstIdx = readIdx(bytePos)
+                        var prevIdx = readIdx(bytePos + bpi)
+                        for v in 2..<vertCount {
+                            let curIdx = readIdx(bytePos + v * bpi)
+                            addTriangle(firstIdx, prevIdx, curIdx)
+                            prevIdx = curIdx
+                        }
+                        bytePos += vertCount * bpi
                     }
                 }
             }
@@ -2093,10 +2115,20 @@ struct ModelViewerScreen: View {
                 geo.materials = [defaultMaterial]
             } else {
                 for material in geo.materials {
-                    if material.diffuse.contents == nil {
+                    // Check if diffuse is nil or very dark/black
+                    var needsDefaultDiffuse = (material.diffuse.contents == nil)
+                    if !needsDefaultDiffuse, let color = material.diffuse.contents as? UIColor {
+                        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+                        color.getRed(&r, green: &g, blue: &b, alpha: &a)
+                        if r < 0.05 && g < 0.05 && b < 0.05 {
+                            needsDefaultDiffuse = true
+                        }
+                    }
+                    if needsDefaultDiffuse {
                         material.diffuse.contents = UIColor(red: 0.6, green: 0.65, blue: 0.7, alpha: 1.0)
                     }
                     material.isDoubleSided = true
+                    material.lightingModel = .phong
                     if material.specular.contents == nil {
                         material.specular.contents = UIColor(white: 0.4, alpha: 1.0)
                         material.shininess = 20
