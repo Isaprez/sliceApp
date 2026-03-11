@@ -481,6 +481,7 @@ struct ModelViewerScreen: View {
     @State private var showGrid = true
     @State private var showDimensions = true
     @State private var showScalePanel = false
+    @State private var showSideMenu = false
     @State private var dimensions: ModelDimensions?
     @State private var scaleX: Float = 1.0
     @State private var scaleY: Float = 1.0
@@ -554,61 +555,52 @@ struct ModelViewerScreen: View {
                         .font(.headline)
                 }
             }
+
+            // Side menu overlay
+            if showSideMenu {
+                Color.black.opacity(0.4)
+                    .ignoresSafeArea()
+                    .onTapGesture {
+                        withAnimation(.easeInOut(duration: 0.25)) {
+                            showSideMenu = false
+                        }
+                    }
+
+                HStack(spacing: 0) {
+                    Spacer()
+                    SideMenuView(
+                        showGrid: $showGrid,
+                        showDimensions: $showDimensions,
+                        showScalePanel: $showScalePanel,
+                        availableFormats: availableFormats,
+                        isConverting: isConverting,
+                        onConvert: { format in
+                            withAnimation { showSideMenu = false }
+                            convertTo(format)
+                        },
+                        onClose: {
+                            withAnimation(.easeInOut(duration: 0.25)) {
+                                showSideMenu = false
+                            }
+                        }
+                    )
+                    .frame(width: 280)
+                    .transition(.move(edge: .trailing))
+                }
+            }
         }
         .navigationTitle(fileURL.lastPathComponent)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             if scene != nil {
-                ToolbarItemGroup(placement: .topBarTrailing) {
-                    // View toggles
-                    Menu {
-                        Button {
-                            showGrid.toggle()
-                        } label: {
-                            Label(
-                                showGrid ? "Ocultar cuadrícula" : "Mostrar cuadrícula",
-                                systemImage: showGrid ? "grid.circle.fill" : "grid.circle"
-                            )
-                        }
-
-                        Button {
-                            showDimensions.toggle()
-                        } label: {
-                            Label(
-                                showDimensions ? "Ocultar dimensiones" : "Mostrar dimensiones",
-                                systemImage: showDimensions ? "ruler.fill" : "ruler"
-                            )
-                        }
-                    } label: {
-                        Image(systemName: "eye")
-                    }
-
-                    // Scale toggle
+                ToolbarItem(placement: .topBarTrailing) {
                     Button {
                         withAnimation(.easeInOut(duration: 0.25)) {
-                            showScalePanel.toggle()
+                            showSideMenu.toggle()
                         }
                     } label: {
-                        Image(systemName: showScalePanel ? "arrow.up.left.and.arrow.down.right.circle.fill" : "arrow.up.left.and.arrow.down.right.circle")
-                    }
-
-                    // Convert menu
-                    if !availableFormats.isEmpty {
-                        Menu {
-                            ForEach(availableFormats, id: \.self) { format in
-                                Button {
-                                    convertTo(format)
-                                } label: {
-                                    Label(
-                                        "Convertir a \(format.displayName)",
-                                        systemImage: iconFor(format)
-                                    )
-                                }
-                            }
-                        } label: {
-                            Image(systemName: "arrow.triangle.2.circlepath")
-                        }
-                        .disabled(isConverting)
+                        Image(systemName: "line.3.horizontal")
+                            .font(.title3)
                     }
                 }
             }
@@ -1068,6 +1060,177 @@ struct ModelViewerScreen: View {
             }
         }
         return indices
+    }
+}
+
+// MARK: - Side Menu
+
+struct SideMenuView: View {
+    @Binding var showGrid: Bool
+    @Binding var showDimensions: Bool
+    @Binding var showScalePanel: Bool
+    let availableFormats: [ModelConverter.OutputFormat]
+    let isConverting: Bool
+    let onConvert: (ModelConverter.OutputFormat) -> Void
+    let onClose: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            // Header
+            HStack {
+                Text("Herramientas")
+                    .font(.headline)
+                    .foregroundStyle(.white)
+                Spacer()
+                Button {
+                    onClose()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.title3)
+                        .foregroundStyle(.gray)
+                }
+            }
+            .padding(.horizontal, 20)
+            .padding(.top, 20)
+            .padding(.bottom, 12)
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 4) {
+                    // Vista section
+                    sectionHeader("Vista")
+
+                    menuToggle(
+                        icon: showGrid ? "grid.circle.fill" : "grid.circle",
+                        title: "Cuadrícula",
+                        isOn: $showGrid
+                    )
+
+                    menuToggle(
+                        icon: showDimensions ? "ruler.fill" : "ruler",
+                        title: "Dimensiones",
+                        isOn: $showDimensions
+                    )
+
+                    Divider().overlay(Color.white.opacity(0.1)).padding(.vertical, 8)
+
+                    // Editar section
+                    sectionHeader("Editar")
+
+                    menuButton(
+                        icon: showScalePanel ? "arrow.up.left.and.arrow.down.right.circle.fill" : "arrow.up.left.and.arrow.down.right.circle",
+                        title: "Redimensionar",
+                        subtitle: showScalePanel ? "Panel abierto" : nil,
+                        highlighted: showScalePanel
+                    ) {
+                        withAnimation(.easeInOut(duration: 0.25)) {
+                            showScalePanel.toggle()
+                        }
+                        onClose()
+                    }
+
+                    // Convertir section
+                    if !availableFormats.isEmpty {
+                        Divider().overlay(Color.white.opacity(0.1)).padding(.vertical, 8)
+
+                        sectionHeader("Convertir")
+
+                        ForEach(availableFormats, id: \.self) { format in
+                            menuButton(
+                                icon: iconFor(format),
+                                title: "Convertir a \(format.displayName)",
+                                subtitle: nil,
+                                highlighted: false
+                            ) {
+                                onConvert(format)
+                            }
+                            .disabled(isConverting)
+                        }
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.bottom, 20)
+            }
+        }
+        .background(Color(UIColor(white: 0.14, alpha: 1.0)))
+        .clipShape(
+            UnevenRoundedRectangle(
+                topLeadingRadius: 16,
+                bottomLeadingRadius: 16,
+                bottomTrailingRadius: 0,
+                topTrailingRadius: 0
+            )
+        )
+        .shadow(color: .black.opacity(0.5), radius: 20, x: -5)
+        .ignoresSafeArea(edges: .bottom)
+    }
+
+    private func sectionHeader(_ title: String) -> some View {
+        Text(title.uppercased())
+            .font(.caption2)
+            .fontWeight(.semibold)
+            .foregroundStyle(.gray)
+            .padding(.horizontal, 4)
+            .padding(.bottom, 4)
+    }
+
+    private func menuToggle(icon: String, title: String, isOn: Binding<Bool>) -> some View {
+        Button {
+            isOn.wrappedValue.toggle()
+        } label: {
+            HStack(spacing: 12) {
+                Image(systemName: icon)
+                    .font(.body)
+                    .frame(width: 24)
+                    .foregroundStyle(isOn.wrappedValue ? .blue : .gray)
+                Text(title)
+                    .font(.subheadline)
+                    .foregroundStyle(.white)
+                Spacer()
+                Image(systemName: isOn.wrappedValue ? "checkmark.circle.fill" : "circle")
+                    .foregroundStyle(isOn.wrappedValue ? .blue : .gray)
+                    .font(.body)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .background(isOn.wrappedValue ? Color.blue.opacity(0.1) : Color.clear)
+            .clipShape(RoundedRectangle(cornerRadius: 10))
+        }
+    }
+
+    private func menuButton(icon: String, title: String, subtitle: String?, highlighted: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 12) {
+                Image(systemName: icon)
+                    .font(.body)
+                    .frame(width: 24)
+                    .foregroundStyle(highlighted ? .blue : .gray)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(title)
+                        .font(.subheadline)
+                        .foregroundStyle(.white)
+                    if let subtitle {
+                        Text(subtitle)
+                            .font(.caption2)
+                            .foregroundStyle(.blue)
+                    }
+                }
+                Spacer()
+                Image(systemName: "chevron.right")
+                    .font(.caption)
+                    .foregroundStyle(.gray)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .background(highlighted ? Color.blue.opacity(0.1) : Color.clear)
+            .clipShape(RoundedRectangle(cornerRadius: 10))
+        }
+    }
+
+    private func iconFor(_ format: ModelConverter.OutputFormat) -> String {
+        switch format {
+        case .stl: return "cube"
+        case .obj: return "cube.transparent"
+        }
     }
 }
 
