@@ -70,35 +70,37 @@ struct ModelViewerView: UIViewRepresentable {
                 for material in geometry.materials {
                     if clippingActive {
                         if material.shaderModifiers?[.geometry] == nil {
+                            let geoShader = [
+                                "#pragma varyings",
+                                "float clipModelY;",
+                                "",
+                                "#pragma body",
+                                "_geometry.clipModelY = _geometry.position.y;"
+                            ].joined(separator: "\n")
+
+                            let fragShader = [
+                                "#pragma arguments",
+                                "float clipYMin;",
+                                "float clipYMax;",
+                                "",
+                                "#pragma body",
+                                "if (_geometry.clipModelY < clipYMin || _geometry.clipModelY > clipYMax) {",
+                                "    discard_fragment();",
+                                "}"
+                            ].joined(separator: "\n")
+
                             material.shaderModifiers = [
-                                .geometry: """
-                                    #pragma varyings
-                                    float clipModelY;
-
-                                    #pragma body
-                                    _geometry.clipModelY = _geometry.position.y;
-                                    """,
-                                .fragment: """
-                                    #pragma arguments
-                                    float clipYMin;
-                                    float clipYMax;
-
-                                    #pragma body
-                                    if (_geometry.clipModelY < clipYMin || _geometry.clipModelY > clipYMax) {
-                                        discard_fragment();
-                                    }
-                                    """
+                                .geometry: geoShader,
+                                .fragment: fragShader
                             ]
                         }
                         let localMin = (clipYMin ?? -1e10) - containerOffsetY
                         let localMax = (clipYMax ?? 1e10) - containerOffsetY
-                        material.setValue(localMin as NSNumber, forKey: "clipYMin")
-                        material.setValue(localMax as NSNumber, forKey: "clipYMax")
+                        material.setValue(NSNumber(value: localMin), forKey: "clipYMin")
+                        material.setValue(NSNumber(value: localMax), forKey: "clipYMax")
                     } else {
                         if material.shaderModifiers?[.geometry] != nil {
-                            material.shaderModifiers = nil
-                            material.setValue(nil, forKey: "clipYMin")
-                            material.setValue(nil, forKey: "clipYMax")
+                            material.shaderModifiers = [:]
                         }
                     }
                 }
