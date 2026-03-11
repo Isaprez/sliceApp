@@ -1101,11 +1101,14 @@ class ClipGeometryCache {
     func prepare(scene: SCNScene) {
         caches.removeAll()
         guard let modelNode = scene.rootNode.childNode(withName: "__model__", recursively: false) else { return }
-        let offsetY = modelNode.position.y
 
         modelNode.enumerateChildNodes { node, _ in
             guard let geometry = node.geometry,
                   let vertexSource = geometry.sources(for: .vertex).first else { return }
+
+            // Use per-node world position for correct Y offset (works for both STL and OBJ)
+            let nodeWorldOrigin = node.convertPosition(SCNVector3Zero, to: nil)
+            let nodeOffsetY = Float(nodeWorldOrigin.y)
 
             let normalSource = geometry.sources(for: .normal).first
 
@@ -1159,8 +1162,8 @@ class ClipGeometryCache {
                         n0 = fn; n1 = fn; n2 = fn
                     }
 
-                    // Y in world space = localY + offsetY
-                    let wy0 = v0.y + offsetY, wy1 = v1.y + offsetY, wy2 = v2.y + offsetY
+                    // Y in world space = localY + node's world Y offset
+                    let wy0 = v0.y + nodeOffsetY, wy1 = v1.y + nodeOffsetY, wy2 = v2.y + nodeOffsetY
                     triangles.append(TriangleData(
                         vertices: [v0, v1, v2],
                         normals: [n0, n1, n2],
@@ -1174,7 +1177,7 @@ class ClipGeometryCache {
                 node: node,
                 originalGeometry: geometry,
                 triangles: triangles,
-                containerOffsetY: offsetY
+                containerOffsetY: nodeOffsetY
             ))
         }
     }
